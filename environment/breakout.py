@@ -287,18 +287,6 @@ if __name__ == "__main__":
             next_state, reward, done = breakout.step(next_state, 1)
 
         print(breakout.render(next_state))
+        
         # plt.imshow(next_state.permute(1, 2, 0).cpu().numpy())
         # plt.show()
-
-    # for _ in range(25):
-
-    #     if _ == 2 or _ == 3 or _ == 4:
-    #         next_state, reward, done = breakout.step(next_state, 2)
-    #     else:
-    #         next_state, reward, done = breakout.step(next_state, 1)
-    #     print(done)
-    
-
-
-    #     plt.imshow(next_state.permute(1, 2, 0).cpu().numpy())
-    #     plt.show()
