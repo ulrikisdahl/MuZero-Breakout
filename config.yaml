@@ -1,0 +1,32 @@
+parameters:
+  training_interval: 0
+  num_episodes: 0
+  num_steps:
+  num_simulations: 50
+  d_max: 0 #max search depth
+  actions: NULL
+  minibatch_size: 0 #???
+
+  agent_name: "MuZeroAgent"
+  environment: "Breakout"
+  environment_path: "environment.breakout"
+
+  model:
+    num_supports: 601 #for support integers in [-300, 300] (paper page 14)
+    supports_min: -300
+    supports_max: 300
+    latent_channels: [128, 256] #number of channels we use in the latent space 
+    state_history_length: 32
+
+    representation_network:
+      num_res_blocks: [2, 3, 3]
+      activation: "relu"
+
+    dynamics_network:
+      num_res_blocks: 8
+      activation: "relu"
+
+    prediction_network:
+      num_res_blocks: 8
+      num_actions: 3
+      activation: "relu" #activation for conv block   
