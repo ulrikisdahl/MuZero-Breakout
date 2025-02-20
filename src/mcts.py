@@ -10,7 +10,6 @@ class TreeStruct:
         self.state = None
 
 
-
 class MCTSSearch:
     def __init__(self, cfg, mu_zero: MuZeroAgent): 
         self.num_simulations = cfg["num_simulations"]
@@ -20,34 +19,46 @@ class MCTSSearch:
         self.discount = cfg["search"]["discount"]
         self.mu_zero = mu_zero
 
-    def search(self, hidden_state: torch.tensor, num_simulations: int, action_mask: list): #TODO: vmap in JAX
+    def search(self, hidden_state: torch.tensor, num_simulations: int, action_mask: torch.tensor): #TODO: use vmap here in JAX
         """
-        Returns the visit count statistics from the root node
+        Performs a latent MCTS search and returns the visit count statistics from the root node
         
         Args:
             actions (num_actions): list of possible actions to take
         
-        
-        state_0: {  
-            action_1: { "N": 10, "Q": 0.5, "P": 0.2, "R": 1.0, "next_state": state_1 }, 
-            action_2: { "N": 5, "Q": -0.2, "P": 0.3, "R": -1.0, "next_state": state_2 },
-            "state": tensor,
-            "value": int
-        },
+        tree: {
+            state_0: {  
+                {action-1}: { "N": 10, "Q": 0.5, "P": 0.2, "R": 1.0, "next_state": state_1 }, 
+                {action-2}: { "N": 5, "Q": -0.2, "P": 0.3, "R": -1.0, "next_state": state_2 },
+                ... ,
+                "state": tensor,
+                "value": int,
+                "expanded": bool
+            },
+            state_0_1 {...}
+        }
         """
-        visit_counts = [0 for _ in range(len(self.actions))]
-
         #Init root
         tree = {
             "state_0": {
                 "state": hidden_state,
-                "value": None
-            } #len("state_0") = 0
+                "value": None,
+                "expanded": False
             }
-        current_node = "state_0" 
+        }
+        current_node = "state_0"
         prev_node = current_node
         subtree = tree[current_node] 
         action = self.actions[torch.randint(0, len(self.actions) + 1)]
+        
+        #prediction for root state
+        policy_dist, value = self.mu_zero.evaluate_state(hidden_state)
+        tree[current_node]["value"] = value
+
+        #apply probability mask
+        for action in self.actions:
+            tree[current_node][action]["P"] = policy_dist[action] * action_mask[action] #action_mask[action] is zero if the action is not allowed
+            tree[current_node][action]["next_state"] = f"state_{0}_{action}" #NOTE: this is a dummy state that will be expanded later
 
         #MCTS
         for simulation in range(self.num_simulations):
@@ -56,7 +67,9 @@ class MCTSSearch:
             
             #traverse the tree
             while True:
-                if len(subtree) == 0: #time to expand
+                if not subtree["expanded"]: #time to expand   
+                    subtree["expanded"] = True
+                    current_node = subtree[action]["next_state"]
                     break
 
                 #SELECT() 
@@ -71,45 +84,40 @@ class MCTSSearch:
                 prev_node = current_node
                 current_node = subtree[action]["next_state"]
                 subtree = tree[current_node]                     #NOTE: at the final step the node action points to does not yet have a real state
-                trajectory.append((action, current_node, subtree[prev_node][action]["R"]))
+                trajectory.append((prev_node, action, subtree[prev_node][action]["R"]))
+                    # --> Need to save prev_node because when we use the reward it is for the edge (s, a) going INTO current_node
 
             #EXPAND() - create state for the expand(node) and stats for children
             expanded_node_state, reward = self.mu_zero.hidden_state_transition(tree[prev_node]["state"], action)
             tree[current_node]["state"] = expanded_node_state
             tree[prev_node][action]["R"] = reward
-            trajectory[-1][-1] = reward
 
-            policy_dist, value = self.mu_zero.evaluate_state(expanded_node_state)
+            trajectory.append((prev_node, action, reward))
+
+            policy_dist, value = self.mu_zero.evaluate_state(expanded_node_state) #wrong to evaluate on expanded state
             tree[current_node]["value"] = value 
             for action in self.actions:
-                next_state = f"state_{simulation}_{action}" #new node
-                tree[current_node][action] = {"N": 0, "Q": 0, "P": policy_dist[action], "next_state": next_state}
+                next_state = f"state_{simulation + 1}_{action}" 
+                tree[current_node][action] = {"N": 0, "Q": 0, "P": policy_dist[action], "R": 0.0, "next_state": next_state}
 
             #BACKUP() - node-l = expanded node (current_node)
-            for k, (action, node) in enumerate(trajectory):
-                bootstrapped_reward = self._bootstrap_reward(trajectory, k)
+            for k, (node, action, r) in enumerate(trajectory):
+                bootstrapped_reward = self._bootstrap_reward(trajectory, k, len(trajectory) + 1, value) 
                 tree[node][action]["N"] += 1
                 tree[node][action]["Q"] = (tree[node][action]["N"] * tree[node][action]["Q"] + bootstrapped_reward) / (tree[node][action]["N"] + 1)
-                
+
+        visit_counts = [tree["state_0"][action]["N"] for action in self.actions]
+        
+        #compute estimated value  ---  NOTE not so sure about this one
+        value = 0.0 
+        for action in self.actions:
+            value += tree["state_0"][action]["N"] * tree["state_0"][action]["Q"]
+        value /= sum(visit_counts)
+
         del hidden_tree, trajectory #NOTE: Dont need to keep the tree
 
-        return visit_counts
-    
-    def _traverse_tree(self, hidden_tree):
-        """
-        Traverses the hidden with UCB selection until leaf node is reached 
-        """
+        return value, visit_counts
         
-        #iteratively traverse the tree using self._selection()
-        self._selection(...)
-        return ...
-        
-    
-    def _create_child(self, policy_i: float):
-        """
-        """
-        return {"children": [], "state": None, "value": None, }
-
     def _selection(self, sub_tree: dict):
         """
         UCB selection 
@@ -130,13 +138,13 @@ class MCTSSearch:
 
         return
 
-    def _bootstrap_reward(self, trajectory: list, k: int, value_l: float):
+    def _bootstrap_reward(self, trajectory: list, k: int, depth: int, value_l: float):
         """
         Cumulative discounted reward
         """
         cumulative_discounted_reward = 0.0
-        for tau in range(self.num_simulations - 1 - k):
-            cumulative_discounted_reward += torch.pow(self.discount, tau) * trajectory[k + 1 + tau][-1] + torch.pow(self.discount, self.num_simulations - k) * value_l
+        for tau in range(depth - 1 - k):
+            cumulative_discounted_reward += torch.pow(self.discount, tau) * trajectory[k + 1 + tau][-1] + torch.pow(self.discount, depth - k) * value_l
         return cumulative_discounted_reward
 
     def k_step_rollout(self):
