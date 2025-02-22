@@ -116,7 +116,7 @@ class MCTSSearch:
 
         del hidden_tree, trajectory #NOTE: Dont need to keep the tree
 
-        return value, visit_counts
+        return value, torch.tensor(visit_counts)
         
     def _selection(self, sub_tree: dict):
         """

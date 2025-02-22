@@ -1,13 +1,13 @@
 import torch
 import torch.nn as nn
 import yaml
-from utils import get_class
+from utils import get_class, ReplayBuffer, ObservationTrajectory
 
 reward_loss_fn = nn.NLLLoss() #used instead of CrossentropyLoss because the model outputs softmax probs
 value_loss_fn = nn.NLLLoss #nn.MSELoss() NOTE: should be MSe
 policy_loss_fn = nn.CrossEntropyLoss()
 
-
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def loss_fn(
         observed_reward: torch.tensor, #scalars
@@ -16,23 +16,21 @@ def loss_fn(
         predicted_value: torch.tensor, #dists
         value_counts: torch.tensor, #scalars
         predicted_policy: torch.tensor, #dists
-        target_transformation #func
-):
+        target_transformation, #func
+        K: int
+    ):
     """
     Args:
         predicted_reward: softmax distribution over supports (remember this is what the network learns to predict, so we dont have to transform it - only invert for inference expectation!)
         predicted_value: softmax distributions over supports
+        target_transformation: transforms the target scalar to a supports representations and extracts the coefficient vector for the supports
     """
     reward_loss = reward_loss(torch.log(predicted_reward), target_transformation(observed_reward)) #TODO: transform targets
     value_loss = value_loss_fn(torch.log(predicted_value), target_transformation(bootstrapped_reward)) #TODO: transform targets
     policy_loss = policy_loss_fn(predicted_policy, value_counts)
+    return (1/K) * (reward_loss + value_loss + policy_loss)
 
 
-    #TODO: What kind of representations to use????
-
-    #scale the loss of each head
-
-    return
 
 class RLSystem:
     def __init__(self, cfg: dict):
@@ -56,8 +54,8 @@ class RLSystem:
         self.environment = environment_class(cfg["environment"]) 
             
         #other stuff
-        self.replay_buffer = [] #dont need to store the specific list for autograd
-        self.observation_trajectory = [] #i = (state_i, action_i, reward_i, visit_counts_i, value_i)
+        self.replay_buffer = ReplayBuffer()
+        self.observation_trajectory = ObservationTrajectory() #i = (state_i, action_i, reward_i, visit_counts_i, value_i)
 
     def train(self):
         """
@@ -69,7 +67,6 @@ class RLSystem:
 
             #network training
             self._training_stage()
-
 
     def _acting_stage(self):
         """
@@ -94,9 +91,12 @@ class RLSystem:
             action = torch.argmax(visit_counts)
             state, reward, done = self.environment.step(state, action.item())
             state = state / 255 #normalize
-            self.observation_trajectory.append((state, action, reward, visit_counts, value))
+            self.observation_trajectory.add_observation(
+                action, state, reward, visit_counts, value
+            )
 
-        self.replay_buffer.append(self.observation_trajectory) #TODO: pad the array to get fixed shape? (must if it is a tensor)
+        if self.observation_trajectory.length > (self.state_history_length + self.k): #only save trajectories with enough observations
+            self.replay_buffer.append(self.observation_trajectory) #TODO: pad the array to get fixed shape? (must be tensor?)
 
     def _sample_action(self, state: torch.tensor):
         """
@@ -104,29 +104,32 @@ class RLSystem:
 
         Here we operate in the latent space, via the MCTS algorithm
         """
-        repnet_input = self._prepare_mcts_input(self.observation_trajectory[-32:], state)
+        repnet_input = self._prepare_mcts_input(state)
         hidden_state = self.mu_zero.hidden_state_transition(repnet_input)
         
         value, visit_counts = self.latent_mcts.search(hidden_state)
         return value, visit_counts
 
-    def _prepare_mcts_input(self, observation_trajectory: list, state: torch.tensor):
+    def _prepare_mcts_input(self, state: torch.tensor):
         """
+        Prepares a tensorized input from the sequence of states and actions
+
         Args:
-            observation_trajectory (32): List of tuples containing the previous 32 state, action and rewards
+            state (channels, resolution[0], resolution[1]): the current state
 
         Returns:
             repnet_input (1, 128, resolution[0], resolution[1]): encoded representation of the last 32 (32*3) states concatenated with last 32 actions 
         """
-        actions = [transition[1] for transition in observation_trajectory]
-        action_tensor = self._encode_actions(actions)
-        state_sequence = [transition[0] for transition in observation_trajectory[1:]] #avoid using the first state in the sublist
-        state_sequence.append(state) #append current state
-        state_sequence = torch.cat(state_sequence, dim=0)
-        repnet_input = torch.cat(state_sequence, action_tensor, dim=0)
+        actions = self.observation_trajectory.get_actions()[-self.state_history_length:] #torch.Tensor([0, 1, 2])
+        action_plane = self._encode_actions(torch.tensor(actions))
+
+        state_sequence = self.observation_trajectory.get_states()[-self.state_history_length:].view(-1, self.resolution[0], self.resolution[1]) #(num_states*channels, res[0], res[1])
+        state_sequence = torch.cat((state_sequence, state), dim=0) 
+
+        repnet_input = torch.cat(state_sequence, action_plane, dim=0)
         return repnet_input.unsqueeze(0) #add batch dimension
     
-    def _encode_actions(self, actions: list):
+    def _encode_actions(self, actions: torch.tensor):
         """
         Takes in a list of actions and returns a tensor of shape (self.state_history_length, resolution[0], resolution[1])
         """
@@ -145,12 +148,7 @@ class RLSystem:
             for _ in range(self.state_history_length - 1)
         ] 
 
-    def _sample_observation(self) -> torch.tensor:
-        """
-        For now I think we will just use all observations
-        """
-        return
-
+ 
     def _training_stage(self):
         """
         Parallel
@@ -170,7 +168,7 @@ class RLSystem:
 
             #prepare data
             batch_end = batch_start + self.minibatch_size
-            mbs_input_states, mbs_input_actions, k_step_policies, k_step_actions, k_step_rewards, k_step_value = self._prepare_minibatch(batch_start, batch_end)
+            mbs_input_actions, mbs_input_states, k_step_policies, k_step_actions, k_step_rewards, k_step_value = self._prepare_minibatch(batch_start, batch_end, device)
             
             #forward pass
             predicted_reward, predicted_value, predicted_policy = self._k_step_rollout(mbs_input_states, mbs_input_actions, k_step_actions)
@@ -183,35 +181,47 @@ class RLSystem:
                 predicted_value=predicted_value,
                 value_counts=k_step_policies, 
                 predicted_policy=predicted_policy,
-                target_transformation=self.mu_zero.rep_net._supports_representation #TODO: improve
+                target_transformation=self.mu_zero.rep_net._supports_representation, #TODO: improve
+                K=self.k
             )
             loss.backward()
             self.mu_zero.optimizer.step()
 
-        
-
-    def _prepare_minibatch(self, batch_start: int, batch_end: int): #TODO: no-grad???
-        """
+    def _prepare_minibatch(self, batch_start: int, batch_end: int, device: str): #TODO: no-grad???
+        """ 
         Needs to:
             Sample (uniformly) a current state and the previous 32 states + actions
             Sample next K rewards and value-counts (policy distributions)
-        """
-        minibatch = self.replay_buffer[batch_start:batch_end] #obs_traj_i = (state_i, action_i, reward_i, visit_counts_i, value_i)
-        observation_trajectory_lengths = [len(obs_traj) for obs_traj in minibatch] 
-        sample_idxs = torch.tensor([torch.randint(31, obs_len - self.k) for obs_len in observation_trajectory_lengths])
-        
-        
 
-        return 
-
-    def _sample_state_trajectory(self):
+        Returns:
+            action_history_minibatch: action sequence up to current (root) state
+            state_history_minibatch: state sequence up to current state 
+            k_step_policies: K MCTS visit-counts statistics after current state 
+            k_step_actions: K actions taken after current state
+            k_step_rewards: K rewards gained after current state
+            k_step_values: estimated values for K states after current
         """
-        """
-        return
+        #used for RepNet input
+        action_history_minibatch = self.replay_buffer.get_batched_past_actions(batch_start, batch_end)
+        state_history_minibatch = self.replay_buffer.get_batch_states(batch_start, batch_start)
+        
+        #used for training loss
+        k_step_policies = self.replay_buffer.get_batched_visit_counts(batch_start, batch_end)
+        k_step_actions = self.replay_buffer.get_batched_future_actions(batch_start, batch_end) 
+        k_step_rewards = self.replay_buffer.get_batched_rewards(batch_start, batch_end)
+        k_step_values = self.replay_buffer.get_batched_values(batch_start, batch_end) 
+        return (
+            action_history_minibatch.to(device),
+            state_history_minibatch.to(device),
+            k_step_policies.to(device),
+            k_step_actions.to(device),
+            k_step_rewards.to(device),
+            k_step_values.to(device)
+        )
 
     def _k_step_rollout(self):
         """
-        ?
+        Recursively creates hidden states by calling Dynamics function K times, and evaluates each hidden state with Prediction function
         """
         return
 
@@ -223,6 +233,14 @@ class RLSystem:
         """
         return 
 
+    def _sample_observation(self) -> torch.tensor:
+        """
+        Currently uses all sample observations in a Replay Buffer
+        """ 
+        return NotImplemented
+    
+
+    
 if __name__ == "__main__":
     
     with open("config.yaml", "r") as file:
@@ -234,11 +252,14 @@ if __name__ == "__main__":
 
 
 """
+Todo:
+- When we predict value/policy during MCTS search the outputs are softmax-distribution vectors 
+
 Questions:
 - Do we no_grad the episode generation?
-- How to estimate the value that MCTS returns?
 
 Check:
 - Normalization: Are the state inputs always in range [0, 1]
+- BOTH hidden states and action tensors should be in range [0, 1]
 
 """
