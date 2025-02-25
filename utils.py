@@ -11,9 +11,9 @@ class ObservationTrajectory:
     actions: list[int] #TODO: init list?
     states: list[torch.tensor]
     rewards: list[float]
-    visit_counts: list[torch.tensor[int]]
+    visit_counts: list[torch.tensor]
     values: list[float] #NOTE: might be torch tensors
-    length: int #TODO: init to zero
+    length: int #only includes the real states of the trajectory (not zero paddings)
 
     def add_observation(self, action, state, reward, visit_counts, values):
         """
@@ -62,7 +62,7 @@ class ReplayBuffer: #TODO: make dataclass
     """
     Stores observation trajectory data, where each observation trajectory contains list[(action, state, reward, value_counts, value), ...]
     """
-    def __init__(self):
+    def __init__(self, K: int):
         self.past_actions_buffer = [] #action-i leading to state-i
         self.future_actions_buffer = [] 
         self.state_buffer = [] #state-i
@@ -70,7 +70,7 @@ class ReplayBuffer: #TODO: make dataclass
         self.visit_counts_buffer = []
         self.value_buffer = [] #estimated value at state-i
         self.hist_seq_len = 32 #includes the root state
-        self.K
+        self.K = K
         self.length = 0
 
     def save_observation_trajectory(self, observation_trajectory: ObservationTrajectory): 
@@ -82,9 +82,9 @@ class ReplayBuffer: #TODO: make dataclass
         Args:
             observation: (action, state, reward, visit_counts, value)
         """
-        state_start = torch.randint(self.hist_seq_len, observation_trajectory.length - self.k) 
+        state_start = torch.randint(self.hist_seq_len, observation_trajectory.length - self.K) 
         trajectory_start = state_start - self.hist_seq_len  #has to be random
-        trajectory_end = state_start + self.k 
+        trajectory_end = state_start + self.K
 
         #used for trajectory history (RepNet input)
         self.past_actions_buffer.append(
@@ -117,7 +117,7 @@ class ReplayBuffer: #TODO: make dataclass
         Returns actions used as input to RepNet
 
         Returns:
-            tensor[]: tensor[batch_size, fixed_trajectory_length, action[int]]
+            tensor[]: tensor[batch_size, fixed_trajectory_length]
         """
         return torch.stack(self.past_actions_buffer[batch_start:batch_end])
 
@@ -139,7 +139,7 @@ class ReplayBuffer: #TODO: make dataclass
     def get_batched_rewards(self, batch_start: int, batch_end: int):
         """
         Returns:
-            tensor[]: tensor[batch_size, K, 1] 
+            tensor[]: tensor[batch_size, K] 
         """
         return torch.stack(self.reward_buffer[batch_start:batch_end])
 
@@ -173,7 +173,7 @@ def get_class(module_name: str, class_name: str):
         return getattr(module, class_name)
     except:
         raise ImportError(f"Could not import module {module_name}")
-    t
+    
 
 def torch_activation_map(activation: str) -> nn.Module:
     """
