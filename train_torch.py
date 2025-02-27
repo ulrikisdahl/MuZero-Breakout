@@ -2,9 +2,12 @@ import torch
 import torch.nn as nn
 import yaml
 from utils import get_class, ReplayBuffer, ObservationTrajectory
+from tqdm import tqdm
+from statistics import mean
+
 
 reward_loss_fn = nn.NLLLoss() #used instead of CrossentropyLoss because the model outputs softmax probs
-value_loss_fn = nn.NLLLoss #nn.MSELoss() NOTE: should be MSe
+value_loss_fn = nn.NLLLoss # nn.NLLLoss(log(softmax(logits)), ...) == nn.CrossEntropyLoss(logits, ...)
 policy_loss_fn = nn.CrossEntropyLoss()
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -24,12 +27,13 @@ def loss_fn(
         predicted_reward: softmax distribution over supports (remember this is what the network learns to predict, so we dont have to transform it - only invert for inference expectation!)
         predicted_value: softmax distributions over supports
         target_transformation: transforms the target scalar to a supports representations and extracts the coefficient vector for the supports
-    """
-    reward_loss = reward_loss(torch.log(predicted_reward), target_transformation(observed_reward)) #TODO: transform targets
-    value_loss = value_loss_fn(torch.log(predicted_value), target_transformation(bootstrapped_reward)) #TODO: transform targets
-    policy_loss = policy_loss_fn(predicted_policy, value_counts)
-    return (1/K) * (reward_loss + value_loss + policy_loss)
-
+    # """
+    # reward_loss = reward_loss_fn(torch.log(predicted_reward).view(-1, 601), target_transformation(observed_reward).view(-1, 601)).mean() #TODO: messy
+    # value_loss = value_loss_fn(torch.log(predicted_value).view(-1, 601), target_transformation(bootstrapped_reward).view(-1, 601)).mean()
+    reward_loss = torch.sum(-target_transformation(observed_reward) * torch.log(predicted_reward) + 1e-8, dim=-1).mean()
+    value_loss = torch.sum(-target_transformation(bootstrapped_reward) * torch.log(predicted_value) + 1e-8, dim=-1).mean()
+    policy_loss = policy_loss_fn(predicted_policy.view(predicted_policy.shape[0], -1), value_counts.view(value_counts.shape[0], -1)).mean()
+    return (1/K) * (reward_loss + value_loss + policy_loss) #TODO: Add regularizing term
 
 
 class RLSystem:
@@ -41,33 +45,36 @@ class RLSystem:
         self.minibatch_size = cfg["minibatch_size"]
         self.real_resolution = cfg["real_resolution"]
         self.latent_resolution = cfg["latent_resolution"]
-        self.state_history_length = cfg["state_history_length"]
+        self.state_history_length = cfg["model"]["state_history_length"]
         self.actions = cfg["actions"]
         self.n_actions = len(self.actions)
         self.K = cfg["num_unroll_steps"]
         self.gamma = cfg["discount_factor"]
+        self.iterations = cfg["num_iterations"]
+        self.epochs = cfg["epochs"]
 
         #classes
         mu_zero_class = get_class("src.networks", cfg["model"]["agent_name"])
         self.mu_zero = mu_zero_class(cfg["model"]) 
         latent_mcts_class = get_class("src.mcts", cfg["search"]["mcts_name"])
-        self.latent_mcts = latent_mcts_class(cfg["search"], self.mu_zero) #NOTE: passing the networks like this is not good
+        self.latent_mcts = latent_mcts_class(cfg, self.mu_zero) #NOTE: passing the networks like this is not good
         environment_class = get_class(cfg["environment"]["environment_path"], cfg["environment"]["environment_name"])
         self.environment = environment_class(cfg["environment"]) 
             
         #other stuff
-        self.replay_buffer = ReplayBuffer()
+        self.replay_buffer = ReplayBuffer(self.K)
         self.observation_trajectory = ObservationTrajectory([], [], [], [], [], 0) #i = (state_i, action_i, reward_i, visit_counts_i, value_i)
 
     def train(self):
         """
         """
-        epochs = 1
-        for _ in range(epochs):
+        for _ in range(self.iterations):
             #episode generation
+            print("ACTING STAGE")
             self._acting_stage()
 
             #network training
+            print("TRAINING STAGE")
             self._training_stage()
 
     def _acting_stage(self):
@@ -75,7 +82,7 @@ class RLSystem:
         Sequential
         """
         self.mu_zero.eval_mode()
-        for episode in range(self.num_episodes):
+        for episode in tqdm(range(self.num_episodes)):
             initial_state = self.environment.get_initial_state() / 255 #normalize
             self._reset_environment()
 
@@ -86,30 +93,32 @@ class RLSystem:
         Runs an entire episode in the environment, from start to finish - Plays the game
         """
         done = False
+        mask = torch.tensor([1.0 for _ in range(self.n_actions)]) 
 
         #At this level we are traversing the real environment
         while not done: #TODO: Add some max length
-            value, visit_counts = self._sample_action(state) #π
+            value, visit_counts = self._sample_action(state, mask) #v, π
             action = torch.argmax(visit_counts)
-            state, reward, done = self.environment.step(state, action.item())
+            state, reward, done, mask = self.environment.step(state * 255, action.item())
             state = state / 255 #normalize
             self.observation_trajectory.add_observation(
                 action, state, reward, visit_counts, value
             )
 
-        if self.observation_trajectory.length > (self.state_history_length + self.K): #only save trajectories with enough observations
-            self.replay_buffer.append(self.observation_trajectory) #TODO: pad the array to get fixed shape? (must be tensor?)
+        print(f"Episode length: {self.observation_trajectory.length}")
+        if self.observation_trajectory.length > (self.K + 1): #only save trajectories with enough observations
+            self.replay_buffer.save_observation_trajectory(self.observation_trajectory)
 
-    def _sample_action(self, state: torch.tensor):
+    def _sample_action(self, state: torch.tensor, mask: list): 
         """
         Latent-MCTS + UCB
 
         Here we operate in the latent space, via the MCTS algorithm
         """
         repnet_input = self._prepare_mcts_input(state, self.real_resolution)
-        hidden_state = self.mu_zero.hidden_state_transition(repnet_input)
+        hidden_state = self.mu_zero.create_hidden_state_root(repnet_input)
         
-        value, visit_counts = self.latent_mcts.search(hidden_state)
+        value, visit_counts = self.latent_mcts.search(hidden_state, mask)
         return value, visit_counts
 
     def _prepare_mcts_input(self, state: torch.tensor, resolution):
@@ -122,16 +131,16 @@ class RLSystem:
         Returns:
             repnet_input (1, 128, resolution[0], resolution[1]): encoded representation of the last 32 (32*3) states concatenated with last 32 actions 
         """
-        actions = self.observation_trajectory.get_actions()[-self.state_history_length:].unsqueeze(0) 
-        action_plane = self._encode_actions(torch.tensor(actions), resolution)
+        actions = self.observation_trajectory.get_actions()[-self.state_history_length:].unsqueeze(0)
+        action_plane = self._encode_actions(actions, self.state_history_length, resolution)
 
-        state_sequence = self.observation_trajectory.get_states()[-self.state_history_length:].view(-1, resolution[0], resolution[1]) #(num_states*channels, res[0], res[1])
+        state_sequence = self.observation_trajectory.get_states()[-(self.state_history_length-1):].view(-1, resolution[0], resolution[1]) #(num_states*channels, res[0], res[1])
         state_sequence = torch.cat((state_sequence, state), dim=0).unsqueeze(0)
 
-        repnet_input = torch.cat(state_sequence, action_plane, dim=1)
+        repnet_input = torch.cat((state_sequence, action_plane), dim=1)
         return repnet_input
     
-    def _encode_actions(self, actions: torch.tensor, resolution: tuple):
+    def _encode_actions(self, actions: torch.tensor, n_actions: int, resolution: tuple):
         """
         Takes in a list of actions and returns a tensor of shape (self.state_history_length, resolution[0], resolution[1])
 
@@ -140,7 +149,7 @@ class RLSystem:
             resolution (2): tuple of resolution
         """
         actions_expanded = (actions / self.n_actions)[:, :, None, None].expand(-1, -1, resolution[0], resolution[1]) #NOTE
-        bias_plane = torch.ones((self.state_history_length, self.resolution[0], self.resolution[1])) *  actions_expanded
+        bias_plane = torch.ones((n_actions, resolution[0], resolution[1]), device=actions_expanded.device) *  actions_expanded
         return bias_plane
 
     def _reset_environment(self):
@@ -149,10 +158,14 @@ class RLSystem:
         
         self.state_history_length - 1: because the initial state is appended afterwards
         """
-        self.observation_trajectory = [
-            (torch.zeros(3, self.real_resolution[0], self.real_resolution[1]), 0, 0.0, 0, 0.0) #NOTE: action values always 0
-            for _ in range(self.state_history_length - 1)
-        ] 
+        self.observation_trajectory = ObservationTrajectory(
+            actions=[0 for _ in range(self.state_history_length)], #TODO: Maybe randomize
+            states=[torch.zeros(3, self.real_resolution[0], self.real_resolution[1]) for _ in range(self.state_history_length - 1)], #one less because we will append initial_state from env
+            rewards=[0 for _ in range(self.state_history_length)],
+            visit_counts=[torch.zeros(self.n_actions) for _ in range(self.state_history_length)],
+            values=[0.0 for _ in range(self.state_history_length)],
+            length=0
+        )
 
  
     def _training_stage(self):
@@ -163,38 +176,43 @@ class RLSystem:
         """
         self.mu_zero.train_mode()
 
-        for batch_start in range(0, self.minibatch_size, len(self.replay_buffer)):
-            """
-            k_step_policies: observed visist-counts used to compare with policy_prediction at each step k in the k-step rollout
-            k_step_actions: selected actions from sample trajectory. Used for making hidden state transitions in the k-step rollout
-            k_step_rewards: observed rewards used to compare with predicted rewards from the k-step rollout
-            k_step_value: observed value from MCTS search used to compare with predicted value at each step k
-            """
-            self.mu_zero.optimizer.zero_grad()
+        for epoch in range(self.epochs):
+            losses = []
+            for batch_start in tqdm(range(0, self.minibatch_size, len(self.replay_buffer))):
+                """
+                k_step_policies: observed visist-counts used to compare with policy_prediction at each step k in the k-step rollout
+                k_step_actions: selected actions from sample trajectory. Used for making hidden state transitions in the k-step rollout
+                k_step_rewards: observed rewards used to compare with predicted rewards from the k-step rollout
+                k_step_value: observed value from MCTS search used to compare with predicted value at each step k
+                """
+                self.mu_zero.optimizer.zero_grad()
 
-            #prepare data
-            batch_end = batch_start + self.minibatch_size
-            mbs_input_actions, mbs_input_states, k_step_policies, k_step_actions, k_step_rewards, k_step_value = self._prepare_minibatch(batch_start, batch_end, device)
-            
-            #forward pass
-            input_actions_encoded = self._encode_actions(mbs_input_actions, self.real_resolution)
-            k_step_actions_encoded = self._encode_actions(k_step_actions, self.latent_resolution) #these actions are used in the hidden state space (=latent_resolution)
-            predicted_reward, predicted_value, predicted_policy = self._k_step_rollout(mbs_input_states, input_actions_encoded, k_step_actions_encoded)
-            bootstrapped_rewards = self._bootstrap_rewards(k_step_rewards, k_step_value)
+                #prepare data
+                with torch.no_grad():
+                    batch_end = batch_start + self.minibatch_size
+                    mbs_input_actions, mbs_input_states, k_step_policies, k_step_actions, k_step_rewards, k_step_value = self._prepare_minibatch(batch_start, batch_end, device)
+                    input_actions_encoded = self._encode_actions(mbs_input_actions, self.state_history_length, self.real_resolution)
+                    k_step_actions_encoded = self._encode_actions(k_step_actions, self.K, self.latent_resolution) #these actions are used in the hidden state space (=latent_resolution)
+                
+                #forward pass
+                predicted_reward, predicted_value, predicted_policy = self._k_step_rollout(mbs_input_states, input_actions_encoded, k_step_actions_encoded)
+                bootstrapped_rewards = self._bootstrap_rewards(k_step_rewards, k_step_value)
 
-            #backward
-            loss = loss_fn(
-                observed_reward=k_step_rewards,
-                predicted_reward=predicted_reward,
-                bootstrapped_reward=bootstrapped_rewards,
-                predicted_value=predicted_value,
-                value_counts=k_step_policies, 
-                predicted_policy=predicted_policy,
-                target_transformation=self.mu_zero.rep_net._supports_representation, #TODO: improve
-                K=self.K
-            )
-            loss.backward()
-            self.mu_zero.optimizer.step()
+                #backward
+                loss = loss_fn(
+                    observed_reward=k_step_rewards,
+                    predicted_reward=predicted_reward,
+                    bootstrapped_reward=bootstrapped_rewards,
+                    predicted_value=predicted_value,
+                    value_counts=k_step_policies, 
+                    predicted_policy=predicted_policy,
+                    target_transformation=self.mu_zero.rep_net._supports_representation, #TODO: improve
+                    K=self.K
+                )
+                losses.append(loss.item())
+                loss.backward()
+                self.mu_zero.optimizer.step()
+            print(f"Epoch {epoch} loss: {mean(losses)}")
 
     def _prepare_minibatch(self, batch_start: int, batch_end: int, device: str): #TODO: no-grad???
         """ 
@@ -212,11 +230,11 @@ class RLSystem:
         """
         #used for RepNet input
         action_history_minibatch = self.replay_buffer.get_batched_past_actions(batch_start, batch_end)
-        state_history_minibatch = self.replay_buffer.get_batch_states(batch_start, batch_start)
+        state_history_minibatch = self.replay_buffer.get_batched_states(batch_start, batch_end).view(self.minibatch_size, -1, self.real_resolution[0], self.real_resolution[1])
         
         #used for training loss
         k_step_policies = self.replay_buffer.get_batched_visit_counts(batch_start, batch_end)
-        k_step_actions = self.replay_buffer.get_batched_future_actions(batch_start, batch_end) 
+        k_step_actions = self.replay_buffer.get_batched_future_actions(batch_start, batch_end) #NOTE: Tends to be mostly just 1s in the start (biased)
         k_step_rewards = self.replay_buffer.get_batched_rewards(batch_start, batch_end)
         k_step_values = self.replay_buffer.get_batched_values(batch_start, batch_end) 
         return (
@@ -243,13 +261,13 @@ class RLSystem:
             predicted_policy (batch_size, K, n_actions)
         """
         #RepNetwork transition
-        repnet_input = torch.cat(input_states, input_actions, dim=1)
+        repnet_input = torch.cat((input_states, input_actions), dim=1)
         hidden_state = self.mu_zero.create_hidden_state_root(repnet_input)
 
         policy_stack = []
         value_stack = []
         reward_stack = []
-        for k in self.K:
+        for k in range(self.K):
             #PredNet evaluation
             """
                 policy_distribution: (bs, n_actions)
@@ -264,7 +282,7 @@ class RLSystem:
                 hidden_state: (bs, ?, res, res)
                 reward: (bs, 601)
             """
-            hidden_state, reward = self.mu_zero.hidden_state_transition(hidden_state, k_step_actions[:, k, :, :])
+            hidden_state, reward = self.mu_zero.hidden_state_transition(hidden_state, k_step_actions[:, k, :, :].unsqueeze(1))
             reward_stack.append(reward)
 
         #save shit
@@ -292,7 +310,7 @@ class RLSystem:
         discounts = self.gamma ** torch.arange(n, device=rewards.device, dtype=rewards.dtype).view(1, 1, -1) #(1, 1, n)
 
         rewards_repeat = rewards[:, None, :].repeat(1, n, 1) #create a new dimension with the repeated samples: (bs, K, K)
-        mask_t = torch.triu(torch.ones((self.K, self.K))) #upper triangular matrix: (K, K)
+        mask_t = torch.triu(torch.ones((self.K, self.K))).to(device) #upper triangular matrix: (K, K)
 
         discounted_rewards = (rewards_repeat * mask_t) * discounts  
         discounted_rewards = discounted_rewards.sum(dim=2) #(bs, K)
@@ -318,15 +336,19 @@ if __name__ == "__main__":
     
     #Args...
     planes = 256
-    repnet_input = torch.ones((1, planes, 6, 6))
+    repnet_input = torch.ones((1, planes, 4, 4))
     
     #inits
     muzero = MuZeroAgent(cfg=config["parameters"]["model"]) 
     mcts = MCTSSearch(cfg=config["parameters"], mu_zero=muzero)
     
     #search
-    mcts.search(repnet_input, torch.tensor([1, 1, 0]).to(torch.float))
-    
+    # print("STARTING SEARCH")
+    # value, visit_counts = mcts.search(repnet_input, action_mask=torch.tensor([0, 1, 1]).to(torch.float))
+    # print("FINISHED SEARCH")
+
+    trainer = RLSystem(config["parameters"])
+    trainer.train()
 
     print("Done")
 
@@ -336,6 +358,9 @@ if __name__ == "__main__":
 """
 Todo:
 - When we predict value/policy during MCTS search the outputs are softmax-distribution vectors 
+- Fix tensor.to(device) abuse
+- Simulate games in parallel (even in MCTS Search)
+    - How: 
 
 Questions:
 - Do we no_grad the episode generation?

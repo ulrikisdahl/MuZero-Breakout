@@ -113,17 +113,18 @@ class BreakoutEnvironment(MuZeroEnvironment):
     
     def __init__(
         self,
+        cfg: dict, 
         width: int = 10,
         height: int = 15,
-        paddle_width: int = 4,
+        paddle_width: int = 5,
         brick_rows: int = 3,
         device: str = "cuda" if torch.cuda.is_available() else "cpu"
     ):
-        self.width = width
-        self.height = height
+        self.height = 16 #cfg["resolution"][0]
+        self.width = 16 #cfg["resolution"][1]
         self.paddle_width = paddle_width
-        self.brick_rows = brick_rows
-        self.device = device
+        self.brick_rows = 5 #cfg["brick_rows"]
+        self.device = "cpu" # device
         
         # Define constants for state tensor channels
         self.CHANNEL_PADDLE = 0
@@ -197,15 +198,14 @@ class BreakoutEnvironment(MuZeroEnvironment):
         # 2. Get ball position
         ball_pos = torch.where(state[self.CHANNEL_BALL] == 1)
         if len(ball_pos[0]) == 0:  # Ball lost
-            return next_state, -1.0, True
+            valid_actions = self.get_valid_actions(next_state)
+            return next_state, -1.0, True, valid_actions
             
         ball_y, ball_x = ball_pos[0][0], ball_pos[1][0]
         
         # 3. Move ball using current direction
         new_ball_y = ball_y + self.ball_dy
         new_ball_x = ball_x + self.ball_dx
-        print(f"Y: {new_ball_y}")
-        print(f"X: {new_ball_x}")
         
         # 4. Handle collisions
         # Wall collisions
@@ -230,8 +230,11 @@ class BreakoutEnvironment(MuZeroEnvironment):
                 # Change horizontal direction based on where ball hits paddle
                 self.ball_dx = 1 if hit_offset >= 0 else -1 #NOTE: has to be "hit_offset >= 0" if we have even number pixels for padle
                 # new_ball_y = ball_y + self.ball_dy #NOTE: delay the reaction such that it doesnt turn around until next step
+                
+                reward = 1 #NOTE: Encourage the agent to hit the ball 
             else:
-                return next_state, -1.0, True  # Ball lost
+                valid_actions = self.get_valid_actions(next_state)
+                return next_state, -1.0, True, valid_actions # Ball lost
         
         # Brick collision
         if next_state[self.CHANNEL_BRICKS, new_ball_y, new_ball_x] == 1:
@@ -248,9 +251,17 @@ class BreakoutEnvironment(MuZeroEnvironment):
         
         # Check if all bricks are destroyed
         if not next_state[self.CHANNEL_BRICKS].any():
-            return next_state, reward + 5.0, True
+            valid_actions = self.get_valid_actions(next_state)
+            return next_state, reward + 5.0, True, valid_actions
         
-        return next_state, reward, done
+        valid_actions = self.get_valid_actions(next_state)
+
+        return next_state, reward, done, valid_actions
+    
+    def reset(self):
+        """
+        """
+        return self.get_initial_state()
     
     def render(self, state: torch.Tensor) -> str:
         """Returns a string representation of the state for debugging."""
@@ -273,19 +284,25 @@ class BreakoutEnvironment(MuZeroEnvironment):
 
 
 if __name__ == "__main__":
-    breakout = BreakoutEnvironment()
+    breakout = BreakoutEnvironment(dict())
     next_state = breakout.get_initial_state()
-    print(next_state[1, :, :])
+    next_state = next_state  #/ 255 <--- TODO: THE BUG (fix is to change the predicates in torch.where)
+    print(next_state.sum(0))
 
     while True:
         action = input()
         if action == "a":
-            next_state, reward, done = breakout.step(next_state, 0)
+            next_state, reward, done, mask = breakout.step(next_state, 0)
         elif action == "d":
-            next_state, reward, done = breakout.step(next_state, 2)
+            next_state, reward, done, mask = breakout.step(next_state, 2)
+        elif action == "g":
+            next_state = breakout.reset()
         else:
-            next_state, reward, done = breakout.step(next_state, 1)
+            next_state, reward, done, mask = breakout.step(next_state, 1)
 
+        print(done)
+        print(reward)
+        print(mask)
         print(breakout.render(next_state))
         
         # plt.imshow(next_state.permute(1, 2, 0).cpu().numpy())

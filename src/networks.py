@@ -45,7 +45,8 @@ class BaseNetwork(nn.Module):
         supports_min = cfg["supports_min"]
         supports_max = cfg["supports_max"]
         self.num_supports = cfg["num_supports"]
-        self.supports = torch.linspace(supports_min, supports_max, self.num_supports)
+        self.device = cfg["device"]
+        self.supports = torch.linspace(supports_min, supports_max, self.num_supports).to(self.device)
 
     def _invertible_transform_normal_to_compact(self, x):
         """
@@ -60,15 +61,20 @@ class BaseNetwork(nn.Module):
         """
         return torch.sign(x) * ((torch.abs(x) + (1-self.epsilon))**2 - 1)
 
-    def _supports_representation(self, target_value):
+    def _supports_representation(self, target_value): #TODO: Move to MuZero class?
         """
         Rewards and Values represented categorically (one hot?) with a possible range of [-300, 300]
         Original value x is represented as x = p_low * x_low + p_high * x_high (page: 14)
 
-        3.7 = 0.3*3 + 0.7*4
+        1. Transform target scalar using invertible transformation to compress
+        2. Map it to the support set using a linear combination of two adjacent supports
+        3. Return a probability distribution over the supports
+
+        Args:
+            target_value (batch_size, K): Observed rewards or values at each step k in the sample
 
         Return:
-            support_vector (601, ): A probability distribution over the supports 
+            support_vector (batch_size, K, 601): A probability distribution over the supports 
         """
 
         #transform to compact representation
@@ -87,11 +93,20 @@ class BaseNetwork(nn.Module):
         p_low = (upper_support - target_transformed) / (upper_support - lower_support)
         p_high = 1 - p_low
 
-        support_vector = torch.zeros(self.num_supports)
-        support_vector[lower_idx] = p_low
-        support_vector[upper_idx] = p_high
+        batch_size, k = target_value.shape
+        support_vector = torch.zeros((batch_size, k, self.num_supports)).to(self.device)
+        support_vector.scatter_(2, lower_idx.unsqueeze(-1), p_low.unsqueeze(-1))
+        support_vector.scatter_(2, upper_idx.unsqueeze(-1), p_high.unsqueeze(-1))
         
-        return support_vector
+        return support_vector #should be (bs, K, 601)
+    
+    def softmax_expectation(self, softmax_distribution):
+        """
+        Computes the expectation of a softmax distribution over the supports
+
+        Used for inference
+        """
+        return torch.sum(softmax_distribution * self.supports)
 
 
 
@@ -109,7 +124,7 @@ class RepresentationNetwork(BaseNetwork):
                 in_channels=in_ch,
                 out_channels=latent_ch[0],
                 kernel_size=(3,3),
-                stride=2,
+                stride=1,
                 padding=1
             )
         )
@@ -126,7 +141,7 @@ class RepresentationNetwork(BaseNetwork):
                 in_channels=latent_ch[0],
                 out_channels=latent_ch[1],
                 kernel_size=(3,3),
-                stride=2,
+                stride=1,
                 padding=1
             )
         )
@@ -267,7 +282,7 @@ class PredictionNetwork(BaseNetwork):
                 stride=1
             ),
             nn.Flatten(start_dim=1, end_dim=-1),
-            nn.Linear(in_features=(in_ch//2) * latent_resolution[0] * latent_resolution[1], out_features=num_actions) #outputs a probability distribution over the possible actions
+            nn.Linear(in_features=(in_ch//2) * latent_resolution[0] * latent_resolution[1], out_features=num_actions) #outputs a "distribution" over the possible actions
         ) #TODO: Remeber argmax!
  
         #generates a value estimate
@@ -310,26 +325,34 @@ class MuZeroAgent(nn.Module):
     def __init__(self, cfg: dict):
         super(MuZeroAgent, self).__init__()
         real_state_planes = cfg["state_history_length"] * 3 + cfg["state_history_length"] #representation function input (page: 13)
+        self.device = "cuda" #cfg["device"]
         self.rep_net = RepresentationNetwork(
             cfg=cfg,
             in_ch=real_state_planes
         )
+        self.rep_net.to(self.device)
         self.dyn_net = DynamicsNetwork(
             cfg=cfg,
             in_ch=cfg["latent_channels"][1], 
-            latent_resolution=(6, 6)
+            latent_resolution=cfg["latent_resolution"]
         )
+        self.dyn_net.to(self.device)
         self.pred_net = PredictionNetwork(
             cfg=cfg,
             in_ch=cfg["latent_channels"][1], 
-            latent_resolution=(6, 6) #TODO
+            latent_resolution=cfg["latent_resolution"] #TODO
         )
+        self.pred_net.to(self.device)
+        self.optimizer = torch.optim.Adam(self.parameters(), lr=cfg["learning_rate"])
 
     def create_hidden_state_root(self, state: torch.tensor):
         """
-        Representation Network
+        Representation Network: Generates hidden root state from a real state
+
+        Args:
+            state (bs, state_history_length * 3 + state_history_length, resolution[0], resolution[1])
         """
-        hidden_state_0 = self.rep_net(state)
+        hidden_state_0 = self.rep_net(state.to(self.device)) #NOTE: device 
         return hidden_state_0
     
     def hidden_state_transition(self, prev_hidden_state: torch.tensor, action: torch.tensor):
@@ -351,13 +374,27 @@ class MuZeroAgent(nn.Module):
         policy_distribution, value = self.pred_net(hidden_state)
         return policy_distribution, value
     
-    
     def _encode_action(self, action: int):
         """
         page 14: 'In Atari, an action is encoded as a one hot vector which is tiled appropriately into planes' 
         """
         return
     
+    def eval_mode(self):
+        """
+        Set all networks to eval mode
+        """
+        self.rep_net.eval()
+        self.dyn_net.eval()
+        self.pred_net.eval()
+    
+    def train_mode(self):
+        """
+        Set all networks to train mode
+        """
+        self.rep_net.train()
+        self.dyn_net.train()
+        self.pred_net.train()
 
 
 if __name__ == "__main__":
@@ -375,16 +412,21 @@ if __name__ == "__main__":
     policy_distribution, value = muzero.evaluate_state(hidden_state)
     print(f"Policy distribution: {policy_distribution.shape}, Value: {value.shape}")
 
-    normal_state = torch.ones(32, 128, 96, 96)
+    normal_state = torch.ones(32, 128, 16, 16)
     hidden_state = muzero.create_hidden_state_root(normal_state)
     print(f"Hidden sate 0: {hidden_state.shape}")
 
-    prev_hidden_state = hidden_state
-    action = torch.ones((32, 1, 6, 6)) 
-    next_hidden_state = muzero.hidden_state_transition(prev_hidden_state, action)
-    print(f"Next hidden state: {next_hidden_state[0].shape}, Reward: {next_hidden_state[1].shape}")
+    # prev_hidden_state = hidden_state
+    # action = torch.ones((32, 1, 6, 6)) 
+    # next_hidden_state = muzero.hidden_state_transition(prev_hidden_state, action)
+    # print(f"Next hidden state: {next_hidden_state[0].shape}, Reward: {next_hidden_state[1].shape}")
 
-    print("done")
+    # print()
+    # for param in muzero.parameters():
+    #     print(param.shape)
+
+    # print(f"N-params: {sum(1 for _ in muzero.parameters())}")
+    # print("done")
     
 
 """

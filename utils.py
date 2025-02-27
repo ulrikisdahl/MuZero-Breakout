@@ -82,7 +82,7 @@ class ReplayBuffer: #TODO: make dataclass
         Args:
             observation: (action, state, reward, visit_counts, value)
         """
-        state_start = torch.randint(self.hist_seq_len, observation_trajectory.length - self.K) 
+        state_start = torch.randint(self.hist_seq_len, self.hist_seq_len + observation_trajectory.length - self.K, (1,)).item() 
         trajectory_start = state_start - self.hist_seq_len  #has to be random
         trajectory_end = state_start + self.K
 
@@ -92,7 +92,7 @@ class ReplayBuffer: #TODO: make dataclass
             observation_trajectory.get_actions()[trajectory_start : state_start] #NOTE 
         )
         self.future_actions_buffer.append(
-            observation_trajectory.get_actions()[state_start : state_start + self.k]
+            observation_trajectory.get_actions()[state_start : state_start + self.K]
         )
         self.state_buffer.append(
             #each observation trajectory is a fixed length
@@ -101,13 +101,13 @@ class ReplayBuffer: #TODO: make dataclass
 
         #used for k-step rollout
         self.reward_buffer.append(
-            observation_trajectory.get_rewards()[state_start : state_start + self.k]
+            observation_trajectory.get_rewards()[state_start : state_start + self.K]
         )
         self.visit_counts_buffer.append(
-            observation_trajectory.get_visit_counts()[state_start : state_start + self.k]
+            observation_trajectory.get_visit_counts()[state_start : state_start + self.K]
         )
         self.value_buffer.append(
-            observation_trajectory.get_values()[state_start : state_start + self.k]
+            observation_trajectory.get_values()[state_start : state_start + self.K]
         )
 
         self.length += 1

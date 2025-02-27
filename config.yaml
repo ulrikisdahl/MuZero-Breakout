@@ -1,32 +1,53 @@
 parameters:
+  num_iterations: 100 #number of total runs
   training_interval: 0
-  num_episodes: 0
-  num_steps:
+  num_episodes: 128 #number of episodes we generate
+  num_steps: 0
+  num_unroll_steps: 5  
   num_simulations: 50
+  epochs: 20
   d_max: 0 #max search depth
-  actions: NULL
-  minibatch_size: 0 #???
+  actions: [0, 1, 2]
+  minibatch_size: 16 #depends on num_episodes
+  discount_factor: 0.9
+  latent_resolution: [4, 4]
+  real_resolution: [16, 16]
 
-  agent_name: "MuZeroAgent"
-  environment: "Breakout"
-  environment_path: "environment.breakout"
+  search:
+    mcts_name: "MCTSSearch"
+    c1: 1.0
+    c2: 1.0  
+    discount_factor: 0.9
 
   model:
+    learning_rate: 0.001
+    agent_name: "MuZeroAgent"
     num_supports: 601 #for support integers in [-300, 300] (paper page 14)
     supports_min: -300
     supports_max: 300
     latent_channels: [128, 256] #number of channels we use in the latent space 
     state_history_length: 32
+    device: "cuda"
+    latent_resolution: [4, 4] #Redundant
 
     representation_network:
       num_res_blocks: [2, 3, 3]
       activation: "relu"
+      learning_rate: 0.001
 
     dynamics_network:
       num_res_blocks: 8
       activation: "relu"
+      learning_rate: 0.001
 
     prediction_network:
       num_res_blocks: 8
       num_actions: 3
       activation: "relu" #activation for conv block   
+      learning_rate: 0.001
+
+  environment:
+    environment_name: "BreakoutEnvironment"
+    environment_path: "environment.breakout"
+    resolution: [16, 16] #[height, width]
+    brick_rows: 5
