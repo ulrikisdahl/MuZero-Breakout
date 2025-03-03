@@ -126,7 +126,7 @@ class BreakoutEnvironment(MuZeroEnvironment):
         self.paddle_width = paddle_width
         self.brick_rows = 5 #cfg["brick_rows"]
         self.device = "cpu" # device
-        self.batch = 2 #the amount of games we suimulate in parallel
+        self.batch = 256 #the amount of games we suimulate in parallel
         
         # Define constants for state tensor channels
         self.CHANNEL_PADDLE = 0
@@ -211,8 +211,6 @@ class BreakoutEnvironment(MuZeroEnvironment):
         """
         next_state = state.clone()
         reward = torch.zeros((self.batch, ))
-        done_mask = torch.zeros((self.batch, ), dtype=torch.bool, device=self.device)
-
 
         # 1. Move paddle
         paddle_pos = torch.argmax(state[:, self.CHANNEL_PADDLE, -1, :], dim=1) #argmax picks the first it finds
@@ -250,19 +248,19 @@ class BreakoutEnvironment(MuZeroEnvironment):
         new_ball_y[missed_ball_mask] = 0
         
         # 4. Handle collisions
-        # Wall collisions
-        # self.ball_dx[torch.logical_or(new_ball_x < 0, new_ball_x >= self.width)] *= -1; #elements that fulfill both predicates will have their dx flipped
-        # new_ball_x[torch.logical_or(new_ball_x < 0, new_ball_x >= self.width)] = ball_x[torch.logical_or(new_ball_x < 0, new_ball_x >= self.width)]
-
         
         #ceiling collision
         self.ball_dy[new_ball_y < 0] *= -1
         new_ball_y[new_ball_y < 0] = ball_y[new_ball_y < 0] #resets the y position to the previous position (but form now on ball_dy points in the opposite direction)
 
         #brick collision
-        brick_mask = next_state[batch_idx, self.CHANNEL_BRICKS, new_ball_y.int(), new_ball_x.int()] == 1 #checks if there is a brick in position (new_ball_x, new_ball_y) = collision
-        self.ball_dy[brick_mask] *= -1 #flip where colision has occured
-        next_state[batch_idx, self.CHANNEL_BRICKS, new_ball_y.int(), new_ball_x.int()] = 0 #remove bricks that are at ball position (new_ball_x, new_ball_y)
+        new_ball_x_bricks = new_ball_x - (new_ball_x % 2) #group bricks in pairs
+        brick_mask = next_state[batch_idx, self.CHANNEL_BRICKS, new_ball_y.int(), new_ball_x_bricks.int()] == 1 #checks if there is a brick in position (new_ball_x, new_ball_y) = collision
+        self.ball_dy = torch.where(brick_mask, -self.ball_dy, self.ball_dy)  
+        next_state[batch_idx, self.CHANNEL_BRICKS, new_ball_y.int(), new_ball_x_bricks.int()] = 0
+        next_state[batch_idx, self.CHANNEL_BRICKS, new_ball_y.int(), (new_ball_x_bricks + 1).int()] = 0
+        
+        new_ball_y = torch.where(brick_mask, ball_y - self.ball_dy, new_ball_y) #NOTE: magic number -self.ball_dy
         reward[brick_mask] += 1 #add reward
 
         #paddle collision
@@ -278,8 +276,6 @@ class BreakoutEnvironment(MuZeroEnvironment):
         hit_offset = new_ball_x - paddle_center
         # self.ball_dx[ball_hits_paddle] = torch.where(hit_offset < 0, -1, 1) #change dx wether ball hit left or right of paddle
         self.ball_dx = torch.where(ball_hits_paddle.bool(), torch.where(hit_offset < 0, -1, 1), self.ball_dx)
-
-
         reward[ball_hits_paddle] += 1                                   #TODO: could lead to reward hacking 
 
         # Clear previous ball position and assign new ball position
@@ -289,7 +285,8 @@ class BreakoutEnvironment(MuZeroEnvironment):
         #check terminal state
         game_finished = ~next_state[:, self.CHANNEL_BRICKS].any(dim=(1, 2)) #(batch, )
         done_mask |= game_finished #1 if already set or game just finished (game_finished)
-        next_state[done_mask] = 0
+        next_state[done_mask, self.CHANNEL_BRICKS] = 0 #need to have some value in CHANNEL_BALL in order to not collapse ball_x dimension
+        next_state[done_mask, self.CHANNEL_PADDLE] = 0
         reward[game_finished] += 5.0
 
         valid_actions = self.get_valid_actions(next_state, paddle_pos_new)
@@ -348,7 +345,7 @@ if __name__ == "__main__":
 
     # next_state, reward, done_mask, valid_actions = breakout.step(next_state, torch.ones(breakout.batch)*2, done_mask)
 
-    print(breakout.render(next_state))
+    print(breakout.render(next_state[:2]))
 
     while True:
         action = "d" #input()
@@ -359,8 +356,8 @@ if __name__ == "__main__":
         else:
             next_state, reward, done_mask, valid_actions = breakout.step(next_state, torch.ones(breakout.batch), done_mask)
 
-        print(breakout.ball_dy)
-        print(breakout.render(next_state))
+        print(done_mask)
+        print(breakout.render(next_state[:2]))
 
     # next_state = next_state  #/ 255 <--- TODO: THE BUG (fix is to change the predicates in torch.where)
     # print(next_state.sum(0))
@@ -385,7 +382,9 @@ if __name__ == "__main__":
 
 """
 REMAINING PROBLEM:
-    when we check if game is lost we set next_state[done_mask] = 0, but this also removes the "ball" point in that state
+    - when we check if game is lost we set next_state[done_mask] = 0, but this also removes the "ball" point in that state
         -> such that next iteration the ball_y (from torch.where(CHANNEL_BALL==1)) gives one less element, causing shape error further down below
             Somehow the current code avoids nulling the PADDLE instead of the BALL?
+
+    - The brick-hit logic fails - Use make a brick two pixels wide instead?
 """ 
