@@ -14,22 +14,32 @@ class ObservationTrajectory:
     visit_counts: list[torch.tensor]
     values: list[float] #NOTE: might be torch tensors
     length: int #only includes the real states of the trajectory (not zero paddings)
+    reward_sum: int
 
     def add_observation(self, action, state, reward, visit_counts, values):
         """
         Adds a single observation tuple to the trajectory
         Increments the length counter
+
+        Args:
+            action (1, )
+            state (3, 16, 16)
+            reward (int)
+            visit_counts (n_actions)
+            values (1, )
         """
         self.actions.append(action)
         self.states.append(state)
         self.rewards.append(reward)
         self.visit_counts.append(visit_counts)
         self.values.append(values) 
+        self.reward_sum += reward
         self.length += 1
 
     def get_actions(self):
         """
-        Resturns a tensor[] of ints
+        Returns:
+            actions (n_history,)
         """
         return torch.tensor(self.actions) 
     
@@ -37,6 +47,7 @@ class ObservationTrajectory:
         """
         Returns a tensor[] of tensors of shape (num_states, channels, resolution[0], resolution[1])
         """ 
+        # return self.states
         return torch.stack(self.states) #(n_states, 3, 96, 96) - important to not merge the two first dims here
 
     def get_rewards(self):
@@ -56,6 +67,12 @@ class ObservationTrajectory:
         Returns a tensor[] of floats
         """
         return torch.tensor(self.values)
+    
+    def get_reward_sum(self):
+        """
+        Returns tensor(1,)
+        """
+        return self.reward_sum
 
 
 class ReplayBuffer: #TODO: make dataclass
@@ -66,6 +83,7 @@ class ReplayBuffer: #TODO: make dataclass
         self.past_actions_buffer = [] #action-i leading to state-i
         self.future_actions_buffer = [] 
         self.state_buffer = [] #state-i
+        self.reward_sums = []
         self.reward_buffer = [] #reward from (state_i-1, action_i)
         self.visit_counts_buffer = []
         self.value_buffer = [] #estimated value at state-i
@@ -83,8 +101,7 @@ class ReplayBuffer: #TODO: make dataclass
             observation: (action, state, reward, visit_counts, value)
         """
         state_start = torch.randint(self.hist_seq_len, self.hist_seq_len + observation_trajectory.length - self.K, (1,)).item() 
-        trajectory_start = state_start - self.hist_seq_len  #has to be random
-        trajectory_end = state_start + self.K
+        trajectory_start = state_start - self.hist_seq_len  #TODO: Wrong   <----- Current code can train on initial padded history only
 
         #used for trajectory history (RepNet input)
         self.past_actions_buffer.append(
@@ -97,7 +114,10 @@ class ReplayBuffer: #TODO: make dataclass
         self.state_buffer.append(
             #each observation trajectory is a fixed length
             observation_trajectory.get_states()[trajectory_start : state_start]
-        )  
+        )
+
+        #save rewards for metrics
+        self.reward_sums.append(observation_trajectory.get_reward_sum().item()) #no need to index because we want all the collected rewards
 
         #used for k-step rollout
         self.reward_buffer.append(
@@ -156,6 +176,22 @@ class ReplayBuffer: #TODO: make dataclass
             tensor[]: [batch_size, K, 1] 
         """
         return torch.stack(self.value_buffer[batch_start:batch_end])
+    
+    def get_reward_sums(self):
+        return self.reward_sums
+
+    def empty_buffer(self):
+        """
+        """
+        self.past_actions_buffer = [] #action-i leading to state-i
+        self.future_actions_buffer = [] 
+        self.state_buffer = [] #state-i
+        self.reward_sums = []
+        self.reward_buffer = [] #reward from (state_i-1, action_i)
+        self.visit_counts_buffer = []
+        self.value_buffer = [] #estimated value at state-i
+        self.hist_seq_len = 32 #includes the root state
+        self.length = 0
 
     def __len__(self):
         return self.length

@@ -106,7 +106,7 @@ class BaseNetwork(nn.Module):
 
         Used for inference
         """
-        return torch.sum(softmax_distribution * self.supports)
+        return torch.sum(softmax_distribution * self.supports, dim=1) #dim=1 for vectorized MCTS, dim=0 for sequential MCTS
 
 
 
