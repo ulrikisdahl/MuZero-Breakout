@@ -257,12 +257,17 @@ class RLSystem:
 
             #metrics + viz
             #mbs_input_states has shape (batch, 3*len_history, 16, 16)
-            state_sequence = mbs_input_states[0].reshape(self.state_history_length, 3, self.real_resolution[0], self.real_resolution[1])
-            # self.filewriter.add_video("trajectory_" + str(epoch), state_sequence)
-            for i in range(self.state_history_length):
-                figure_i = state_sequence[i].cpu() #.permute(1, 2, 0).detach().numpy()
-                self.filewriter.add_figure(f"trajectory_{epoch}_{i}", figure_i)
+            state_sequence = mbs_input_states[0].reshape(self.state_history_length, 3, self.real_resolution[0], self.real_resolution[1]) * 255
+            # self.filewriter.add_image(f"trajectory_{epoch}", state_sequence, dataformats="NCHW")
 
+            # Method 1: Add images with a step dimension for slider functionality
+            for i in range(self.state_history_length):
+                # Add each frame as a separate step in the same run
+                self.filewriter.add_image(f"trajectory_{epoch}/frame", state_sequence[i], global_step=i, dataformats="CHW")
+                
+                # Also add text describing the action for this frame
+                action = int(mbs_input_actions[0][i])
+                self.filewriter.add_text(f"trajectory_{epoch}/action", f"Action: {action}", global_step=i)
 
             action_sequence = mbs_input_actions[0]
             action_log = "\n".join([f"Timestep {t}: Action {int(action_sequence[t])}" for t in range(self.state_history_length)])
