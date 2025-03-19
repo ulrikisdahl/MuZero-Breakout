@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from utils import torch_activation_map
+import torch.nn.functional as F
 
 class ConvBlock(nn.Module):
     """
@@ -49,65 +50,66 @@ class BaseNetwork(nn.Module):
         self.supports = torch.linspace(supports_min, supports_max, self.num_supports).to(self.device)
 
     def _invertible_transform_normal_to_compact(self, x):
-        """
-        Maps the reward/value to a more compact representation to compress large values into the support representation range
-        Obtain categorical representations of the reward/value targets equivalent to the output representations of the networks
-        """
+        """ Maps the reward/value to a more compact representation to compress large values into the support representation range
+        Obtain categorical representations of the reward/value targets equivalent to the output representations of the networks """
         return torch.sign(x) * (torch.sqrt(torch.abs(x) + 1) - 1 + self.epsilon * x)
-    
+        
     def _invertible_transform_compact_to_normal(self, x):
-        """
-        Maps the reward/value back to the original representation
-        """
+        """ Maps the reward/value back to the original representation """
         return torch.sign(x) * ((torch.abs(x) + (1-self.epsilon))**2 - 1)
-
-    def _supports_representation(self, target_value): #TODO: Move to MuZero class?
-        """
-        Rewards and Values represented categorically (one hot?) with a possible range of [-300, 300]
+        
+    def _supports_representation(self, target_value):
+        """ Rewards and Values represented categorically with a possible range of [-300, 300]
         Original value x is represented as x = p_low * x_low + p_high * x_high (page: 14)
-
         1. Transform target scalar using invertible transformation to compress
         2. Map it to the support set using a linear combination of two adjacent supports
         3. Return a probability distribution over the supports
-
+        
         Args:
             target_value (batch_size, K): Observed rewards or values at each step k in the sample
-
+            
         Return:
-            support_vector (batch_size, K, 601): A probability distribution over the supports 
+            support_vector (batch_size, K, num_supports): A probability distribution over the supports
         """
-
-        #transform to compact representation
+        # Transform to compact representation
         target_transformed = self._invertible_transform_normal_to_compact(target_value)
         
-        #find the closes support indecies
+        # Find the closest support indices
         lower_idx = torch.searchsorted(self.supports, target_transformed, right=True) - 1
-        lower_idx = lower_idx.clamp(0, self.num_supports - 1)
-        upper_idx = (lower_idx + 1).clamp(0, self.num_supports - 1)
-
-        #get the supports
+        lower_idx = lower_idx.clamp(0, self.num_supports - 2)  # Fix 3: Ensure upper_idx doesn't go out of bounds
+        upper_idx = lower_idx + 1
+        
+        # Get the supports
         lower_support = self.supports[lower_idx]
         upper_support = self.supports[upper_idx]
-
-        #compute linear combination coefficients
-        p_low = (upper_support - target_transformed) / (upper_support - lower_support)
+        
+        # Compute linear combination coefficients
+        p_low = (upper_support - target_transformed) / (upper_support - lower_support + 1e-10)
         p_high = 1 - p_low
-
+        
         batch_size, k = target_value.shape
         support_vector = torch.zeros((batch_size, k, self.num_supports)).to(self.device)
         support_vector.scatter_(2, lower_idx.unsqueeze(-1), p_low.unsqueeze(-1))
         support_vector.scatter_(2, upper_idx.unsqueeze(-1), p_high.unsqueeze(-1))
         
-        return support_vector #should be (bs, K, 601)
+        return support_vector
     
-    def softmax_expectation(self, softmax_distribution):
+    def _softmax_expectation(self, softmax_distribution):
         """
         Computes the expectation of a softmax distribution over the supports
 
         Used for inference
         """
-        return torch.sum(softmax_distribution * self.supports, dim=1) #dim=1 for vectorized MCTS, dim=0 for sequential MCTS
+        return torch.sum(softmax_distribution * self.supports, dim=-1)
 
+    def inverted_softmax_expectation(self, softmax_distribution):
+        """
+        First computes the expected value under the respective "softmax" distribution and subsequently inverts the scaling transformation
+        """
+        softmax_distribution = F.softmax(softmax_distribution, dim=-1)
+        softmax_expectation = self._softmax_expectation(softmax_distribution)
+        inverted_transform = self._invertible_transform_compact_to_normal(softmax_expectation)
+        return inverted_transform
 
 
 class RepresentationNetwork(BaseNetwork):
@@ -128,7 +130,7 @@ class RepresentationNetwork(BaseNetwork):
                 padding=1
             )
         )
-        for _ in range(num_res_blocks[0]): #first sequence of residual blocks
+        for _ in range(num_res_blocks[0]): 
             self.blocks.append(
                 ResidualBlock(
                     in_ch=latent_ch[0],
@@ -221,8 +223,14 @@ class DynamicsNetwork(BaseNetwork):
                 padding=0
             ),
             nn.Flatten(start_dim=1, end_dim=-1),
-            nn.Linear(in_features=in_ch*latent_resolution[0]*latent_resolution[1], out_features=num_supports),
-            nn.Softmax(dim=1)
+
+            #AlphaZero version
+            # nn.Linear(in_features=in_ch*latent_resolution[0]*latent_resolution[1], out_features=1)
+            # nn.Tanh()
+
+            #MuZero version - n_supports logits
+            nn.Linear(in_features=in_ch*latent_resolution[0]*latent_resolution[1], out_features=num_supports)
+            # nn.Softmax(dim=1)
         )
 
     def forward(self, hidden_state):
@@ -283,7 +291,7 @@ class PredictionNetwork(BaseNetwork):
             ),
             nn.Flatten(start_dim=1, end_dim=-1),
             nn.Linear(in_features=(in_ch//2) * latent_resolution[0] * latent_resolution[1], out_features=num_actions) #outputs a "distribution" over the possible actions
-        ) #TODO: Remeber argmax!
+        ) 
  
         #generates a value estimate
         self.value_head = nn.Sequential(
@@ -298,8 +306,13 @@ class PredictionNetwork(BaseNetwork):
             nn.Flatten(start_dim=1, end_dim=-1),
             #NOTE: Accodring to AlphaGo Zero paper there should be another fully-connected layer here
             
-            nn.Linear(in_features=(in_ch//2) * latent_resolution[0] * latent_resolution[1], out_features=num_supports),
-            nn.Softmax(dim=1) #gives us the probability distribution over the support representation
+            #AlphaZero version
+            # nn.Linear(in_features=(in_ch//2) * latent_resolution[0] * latent_resolution[1], out_features=1)
+            # nn.Tanh()
+
+            #MuZero version - n_supports logits
+            nn.Linear(in_features=(in_ch//2) * latent_resolution[0] * latent_resolution[1], out_features=num_supports) #output raw logits
+            # nn.Softmax(dim=1) #gives us the probability distribution over the support representation
         ) 
 
     def forward(self, hidden_state: torch.tensor):
@@ -311,16 +324,17 @@ class PredictionNetwork(BaseNetwork):
             policy_distribution (batch_size, num_actions): 
             value (batch_size, num_supports): 
         """
+        x = hidden_state
         for res_block in self.res_blocks:
-            x = res_block(hidden_state)
+            x = res_block(x)
         
         policy_distribution = self.policy_head(x)
         value = self.value_head(x)
 
         return policy_distribution, value
 
-        
-        
+
+    
 class MuZeroAgent(nn.Module):
     def __init__(self, cfg: dict):
         super(MuZeroAgent, self).__init__()
@@ -340,10 +354,11 @@ class MuZeroAgent(nn.Module):
         self.pred_net = PredictionNetwork(
             cfg=cfg,
             in_ch=cfg["latent_channels"][1], 
-            latent_resolution=cfg["latent_resolution"] #TODO
+            latent_resolution=cfg["latent_resolution"] 
         )
         self.pred_net.to(self.device)
-        self.optimizer = torch.optim.Adam(self.parameters(), lr=cfg["learning_rate"])
+        self.optimizer = torch.optim.Adam(self.parameters(), lr=cfg["learning_rate"], weight_decay=0.0001)
+        # self.scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lambda t: max(0.01 / 0.1, torch.exp(torch.tensor([-0.1 * t])).item())) #exponential decay
 
     def create_hidden_state_root(self, state: torch.tensor):
         """
@@ -360,8 +375,13 @@ class MuZeroAgent(nn.Module):
         Dynamics Network
 
         Action concatenated along channel (plane) dimension
-        
-        _encode_action here?
+
+        Args:
+            prev_hidden_state (batch_size, planes, latent_resolution[0], latent_resolution[1])
+
+        Returns:
+            hidden_state (batch_size, planes, latent_resolution[0], latent_resolution[1])
+            reward (batch_size, )
         """
         prev_hidden_state_with_action = torch.cat([prev_hidden_state, action], dim=1)
         hidden_state, reward = self.dyn_net(prev_hidden_state_with_action)
@@ -370,6 +390,13 @@ class MuZeroAgent(nn.Module):
     def evaluate_state(self, hidden_state: torch.tensor):
         """
         Prediction Network
+
+        Args:
+            hidden_state (batch_size, planes, latent_resolution[0], latent_resolution[1])
+
+        Returns:
+            policy_distribution (batch_size, n_actions)
+            value (batch_size)
         """
         policy_distribution, value = self.pred_net(hidden_state)
         return policy_distribution, value
