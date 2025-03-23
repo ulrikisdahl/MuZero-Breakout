@@ -1,11 +1,11 @@
 parameters:
   num_iterations: 30 #number of total runs
   training_interval: 0 #not used
-  num_episodes: 16 #30 #number of n_parallel*epiosode iterations (each creates n_parallel episodes) <--- N-Batches
+  num_episodes: 16 #16 #number of n_parallel*epiosode iterations (each creates n_parallel episodes) <--- N-Batches
   num_steps: 0
-  num_unroll_steps: 5  
-  num_simulations: 21 #in MCTS
-  epochs: 5
+  num_unroll_steps: 5  #K
+  num_simulations: 30 #21 #in MCTS
+  epochs: 4
   d_max: 0 #max search depth
   actions: [0, 1, 2]
   minibatch_size: 128 #depends on num_episodes
@@ -14,7 +14,7 @@ parameters:
   real_resolution: [16, 16]
   n_parallel: 32 #should be 32
 
-  replay_buffer_max: 7000 #512 * 7 (we create 16*32=512 episodes per iter)
+  replay_buffer_max: 50000 #512 * 7 (we create 16*32=512 episodes per iter)
 
   load_weights: False
   checkpoint_path: "weights/checkpt1.pth"
@@ -22,11 +22,11 @@ parameters:
   search:
     mcts_name: "MCTSSearchVec" #"MCTSSearch"
     c1: 1.25
-    c2: 19652.0  
+    c2: 19652.0   
     discount_factor: 0.98
 
   model:
-    learning_rate: 0.001
+    learning_rate: 0.001 # 0.001
     agent_name: "MuZeroAgent"
     num_supports: 11 #for support integers in [-300, 300] (paper page 14)
     supports_min: -5
@@ -37,20 +37,18 @@ parameters:
     latent_resolution: [4, 4] #Redundant
 
     representation_network:
-      num_res_blocks: [1, 1, 1]
+      num_res_blocks: [1, 2, 2]
       activation: "relu"
-      learning_rate: 0.001
 
     dynamics_network:
-      num_res_blocks: 3
+      num_res_blocks: 4
+      num_actions: 3
       activation: "relu"
-      learning_rate: 0.001
 
     prediction_network:
-      num_res_blocks: 3
+      num_res_blocks: 4
       num_actions: 3
       activation: "relu" #activation for conv block   
-      learning_rate: 0.001
 
   environment:
     # environment_name: "BreakoutEnvironment"
@@ -60,7 +58,7 @@ parameters:
     resolution: [16, 16] #[height, width]
     brick_rows: 5
     n_parallel: 32
-    paddle_hit_reward: 1.0
-    brick_hit_reward: 1.0
-    game_lost_reward: -2.0
+    paddle_hit_reward: 1.0 #1.0
+    brick_hit_reward: 1.0 
+    game_lost_reward: -1.0
     game_won_reward: 5.0
