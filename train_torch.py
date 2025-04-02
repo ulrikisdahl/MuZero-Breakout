@@ -7,7 +7,8 @@ from statistics import mean
 import random
 from datetime import datetime
 from torch.utils.tensorboard import SummaryWriter 
-
+import os
+import torch.nn.functional as F
 
 reward_loss_fn = nn.NLLLoss() #used instead of CrossentropyLoss because the model outputs softmax probs
 value_loss_fn = nn.NLLLoss # nn.NLLLoss(log(softmax(logits)), ...) == nn.CrossEntropyLoss(logits, ...)
@@ -15,28 +16,43 @@ policy_loss_fn = nn.CrossEntropyLoss()
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+
 def loss_fn(
-        observed_reward: torch.tensor, #scalars
-        predicted_reward: torch.tensor, #dists
-        bootstrapped_reward: torch.tensor, #scalars
-        predicted_value: torch.tensor, #dists
-        value_counts: torch.tensor, #scalars
-        predicted_policy: torch.tensor, #dists
-        target_transformation, #func
+        observed_reward: torch.tensor, 
+        predicted_reward: torch.tensor, 
+        bootstrapped_reward: torch.tensor, 
+        predicted_value: torch.tensor, 
+        visit_counts: torch.tensor, 
+        predicted_policy: torch.tensor, 
+        target_transformation, #_supports_representation
         K: int
     ):
     """
     Args:
-        predicted_reward: softmax distribution over supports (remember this is what the network learns to predict, so we dont have to transform it - only invert for inference expectation!)
-        predicted_value: softmax distributions over supports
+        predicted_reward: predicted distribution over supports
+        predicted_value: predicted distributions over supports
         target_transformation: transforms the target scalar to a supports representations and extracts the coefficient vector for the supports
-    # """
-    # reward_loss = reward_loss_fn(torch.log(predicted_reward).view(-1, 601), target_transformation(observed_reward).view(-1, 601)).mean() #TODO: messy
-    # value_loss = value_loss_fn(torch.log(predicted_value).view(-1, 601), target_transformation(bootstrapped_reward).view(-1, 601)).mean()
-    reward_loss = torch.sum(-target_transformation(observed_reward) * torch.log(predicted_reward) + 1e-8, dim=-1).mean()
-    value_loss = torch.sum(-target_transformation(bootstrapped_reward) * torch.log(predicted_value) + 1e-8, dim=-1).mean()
-    policy_loss = policy_loss_fn(predicted_policy.view(predicted_policy.shape[0], -1), value_counts.view(value_counts.shape[0], -1)).mean()
+    """
+    reward_loss = F.kl_div( #TODO: check these mid training (see how much we have weighted the different terms now)
+        F.log_softmax(predicted_reward.view(-1, predicted_reward.shape[-1]), dim=-1), 
+        # F.softmax(target_transformation(observed_reward).view(-1, predicted_reward.shape[-1]), dim=-1),
+        target_transformation(observed_reward).view(-1, predicted_reward.shape[-1]),
+        reduction="batchmean"
+    )
+    value_loss = F.kl_div(
+        F.log_softmax(predicted_value.view(-1, predicted_value.shape[-1]), dim=-1), 
+        # F.softmax(target_transformation(bootstrapped_reward).view(-1, predicted_value.shape[-1]), dim=-1),
+        target_transformation(bootstrapped_reward).view(-1, predicted_value.shape[-1]),
+        reduction="batchmean"
+    )
+
+    visit_counts_normalized = visit_counts / visit_counts.sum(dim=-1, keepdim=True)
+    policy_loss = policy_loss_fn(
+        F.log_softmax(predicted_policy.view(-1, predicted_policy.shape[-1]), dim=-1),
+        visit_counts_normalized.view(-1, visit_counts_normalized.shape[-1])
+    )
     return (1/K) * (reward_loss + value_loss + policy_loss) #TODO: Add regularizing term
+
 
 class RLSystem:
     def __init__(self, cfg: dict):
@@ -55,46 +71,97 @@ class RLSystem:
         self.iterations = cfg["num_iterations"]
         self.epochs = cfg["epochs"]
         self.n_parallel = cfg["n_parallel"]
+        self.temperature = 1.0
 
         #internal classes
         mu_zero_class = get_class("src.networks", cfg["model"]["agent_name"])
         self.mu_zero = mu_zero_class(cfg["model"]) 
+        self.mu_zero_target = mu_zero_class(cfg["model"]) #Target Network
+        self.mu_zero_target.load_state_dict(self.mu_zero.state_dict())
         latent_mcts_class = get_class("src.parallel_mcts", cfg["search"]["mcts_name"])
-        self.latent_mcts = latent_mcts_class(cfg, self.mu_zero) #NOTE: passing the networks like this is not good
+        # latent_mcts_class = get_class("src.parallel_mcts_2", cfg["search"]["mcts_name"])
+        self.latent_mcts = latent_mcts_class(cfg, self.mu_zero_target) #NOTE: passing the networks like this is not good
         environment_class = get_class(cfg["environment"]["environment_path"], cfg["environment"]["environment_name"])
         self.environment = environment_class(cfg["environment"]) 
-            
+        # self.environment = environment_class(cfg["n_parallel"], "cpu") #NOTE: Gym ALE breakout
+
+        #Disable gradients for Target Network
+        for param in self.mu_zero_target.parameters():
+            param.requires_grad = False
+
         #Replay Buffer
-        self.replay_buffer = ReplayBuffer(self.K)
+        self.replay_buffer = ReplayBuffer(self.state_history_length, self.K, cfg["replay_buffer_max"], cfg["discount_factor"], self.n_parallel)
         self.observation_trajectories = []
+        self.samples_before_train = cfg["samples_before_train"]
+        self.training_iteration = 0
+        self.training_step = 0
+        self.num_batches = cfg["num_batches"]
+        # self.acting_steps = 0 
 
         #logging 
         self.logdir = "logs/train_data/"
         self.filewriter = SummaryWriter(self.logdir)
+        self.acting_step = 0
+
+        #statistics
+        self.action_stats = torch.tensor([])
+
+        self.init_iteration = 0
+        self.load_weights = cfg["load_weights"]
+        self.checkpoint_path = cfg["checkpoint_path"]
+        if self.load_weights:
+            self._load_weights()
+
+        self.mcts_iter = 0
 
     def train(self):
         """
         """
-        for _ in range(self.iterations):
+        started_training = False
+        for iteration in range(self.init_iteration, 50000):
+            """
+            iteration BURDE BEGYNNE Å TELLE FRA DA TRENING HAR BEGYNT!
+            """
+            if self.training_iteration == 200:
+                #make agent a little more greedy
+                self.temperature = 0.5
+                self.latent_mcts.initial_noise_weight = 0.14
+
+            if self.training_iteration == 300:
+                self.temperature = 0.3
+                self.latent_mcts.initial_noise_weight = 0.1
+
+            if iteration % 15 == 0 and iteration != 0 and started_training:
+                self.load_latest_weights() #update Target Network
+                print(f"Updates Target Network. STEPS: {self.training_step}")
+
             #episode generation
-            print("ACTING STAGE")
+            print(f"ACTING STAGE {iteration}")
             self._acting_stage()
 
             #network training
-            print("TRAINING STAGE")
-            self._training_stage()
+            print(f"TRAINING STAGE {iteration}")
+            if self.replay_buffer.length > self.samples_before_train:
+                self._training_stage()
+                self.training_iteration += 1
+                started_training = True
 
-            #reset replay buffer
-            self.replay_buffer.empty_buffer()
+            if iteration % 15 == 0 and self.replay_buffer.length > self.samples_before_train: #TODO: This is way too rare! (we reached STEPS=2115)
+                print("SAVED WEIGHTS!")
+                self._save_weights(iteration)
+
+            print(f"REPLAY_BUFFER: {self.replay_buffer.length}, STEPS: {self.training_step}")
+
+        self._save_weights(iteration)
 
     def _acting_stage(self):
         """
         Sequential
         """
-        self.mu_zero.eval_mode()
+        self.mu_zero_target.eval_mode()
         for episode in tqdm(range(self.num_episodes)):
-            initial_state = self.environment.get_initial_state() / 255 #(batch, 3, 16, 16)
-            self._reset_environment() #resets self.observation_trajectories
+            initial_state, done = self.environment.reset()
+            self._pad_initial_state(initial_state) #resets self.observation_trajectories
 
             self._run_episode(initial_state)
 
@@ -103,40 +170,72 @@ class RLSystem:
         Runs an entire episode in the environment, from start to finish - Plays the game
 
         Args:
-            state (3, 16, 16)
+            state (batch_size, 3, 16, 16)
         """
+        # temperature = min(max(1.0 - ((self.training_iteration - 9) * 0.02), 0.2), 1.0) #temperature annealing
+        
         done_mask = torch.zeros((state.shape[0]), dtype=torch.bool)
         prev_done_mask = done_mask
         valid_actions = torch.ones((state.shape[0], self.n_actions)) #TODO: Could introduce some randomization here
 
-        #At this level we are traversing the real environment
         length_counter = 0
         while not torch.all(done_mask == True):
+
+            if length_counter > 200:
+                break
+            
             value, visit_counts = self._sample_action(state, valid_actions) #v, π
-            action = torch.argmax(visit_counts, dim=1)
-            state, reward, done_mask, valid_actions = self.environment.step(state * 255, action, done_mask)
-            state = state / 255 #normalize
+
+            #temperature based sampling
+            visit_counts_temp = visit_counts ** (1/self.temperature)
+            probs = visit_counts_temp / visit_counts_temp.sum(dim=1, keepdim=True)
+            # probs = probs * valid_actions
+            # probs = probs / probs.sum(dim=1, keepdim=True) #redistribute probabilities
+            action = torch.zeros(probs.shape[0], dtype=torch.long)
+
+            for i in range(probs.shape[0]):
+                dist = torch.distributions.Categorical(probs[i])
+                action[i] = dist.sample()
+
+            # action = torch.argmax(visit_counts, dim=1)
+
+            state, reward, done_mask, valid_actions = self.environment.step(state, action, done_mask)
+
+            save_state = state
             for idx in range(len(self.observation_trajectories)):
                 if not prev_done_mask[idx]: #game is not finished
                     self.observation_trajectories[idx].add_observation(
-                        action[idx], state[idx], reward[idx], visit_counts[idx], value[idx]
+                        action[idx], save_state[idx], reward[idx], visit_counts[idx], value[idx] #value and visit_counts are for previous state
                     )
             prev_done_mask = done_mask.clone()
 
             """
             CRUICAL:
-                Certain games get the ball behind the brick wall very early and this makes them last MUCH longer (too long)s
+                Certain games get the ball behind the brick wall very early and this makes them last MUCH longer (too long)
             """
-            if length_counter > 102:
-                break
+            # if length_counter > 102:
+            #     break
             length_counter += 1
+            self.action_stats = torch.cat((self.action_stats, action), dim=0)
 
-            #NOTE: could save observation trajectories here instead based on done_mask
-
-        print(f"Episode length: {self.observation_trajectories[0].length}, {self.observation_trajectories[1].length}, {self.observation_trajectories[2].length}")
+        episode_lens = [obs.length for obs in self.observation_trajectories]
+        max_len = max(episode_lens)
+        avg_len = mean(episode_lens)
+        value_counts = torch.bincount(self.action_stats.long(), minlength=self.n_actions)
+        print(f"Max episode length: {max_len}, Average episode length: {avg_len}")
+        print(f"Value counts 0: {value_counts[0]}, 1: {value_counts[1]}, 2: {value_counts[2]}")
+        # print(f"Value counts 0: {value_counts[0]}, 1: {value_counts[1]}, 2: {value_counts[2]}, 3: {value_counts[3]}")
         for observation_trajectory in self.observation_trajectories:
             if observation_trajectory.length > (self.K + 1):
                 self.replay_buffer.save_observation_trajectory(observation_trajectory)
+
+        del self.action_stats
+        self.action_stats = torch.tensor([]) #empty
+        
+        rewards = self.replay_buffer.get_reward_sums()
+        avg_reward = mean(rewards)
+        self.filewriter.add_scalar("Reward/avg", avg_reward, global_step=self.acting_step)
+        self.acting_step += 1
 
 
     def _sample_action(self, state: torch.tensor, mask: list): 
@@ -144,18 +243,22 @@ class RLSystem:
         Latent-MCTS + UCB
         Here we operate in the latent space, via the MCTS algorithm
 
+        Args:
+            state (batch_size, 3, 16, 16)
+            mask (32, 3): 0/1 mask representing if action is legal or not
+
         Returns:
-            value (1,): 
-            visit_counts (n_actions,)
+            value (batch_size): 
+            visit_counts (batch_size, n_actions)
         """
         repnet_inputs = []
         for idx, observation_trajectory in enumerate(self.observation_trajectories):
             repnet_input = self._prepare_mcts_input(state[idx], observation_trajectory, self.real_resolution,) 
             repnet_inputs.append(repnet_input) 
         repnet_inputs = torch.stack(repnet_inputs)
-        hidden_state = self.mu_zero.create_hidden_state_root(repnet_inputs) #
+        hidden_state = self.mu_zero_target.create_hidden_state_root(repnet_inputs) #
         
-        value, visit_counts = self.latent_mcts.search(hidden_state, mask) #(batch,), (batch, n_actions)
+        value, visit_counts = self.latent_mcts.search(hidden_state, mask, self.training_iteration)
         return value, visit_counts
 
     def _prepare_mcts_input(self, state: torch.tensor, observation_trajectory: ObservationTrajectory, resolution: tuple):
@@ -168,7 +271,7 @@ class RLSystem:
         Returns:
             repnet_input (1, 128, resolution[0], resolution[1]): encoded representation of the last 32 (32*3) states concatenated with last 32 actions 
         """
-        #state = (batch, channels, res[0], res[1])        
+        #state = (batch, channels, res[0], res[1])
         actions = observation_trajectory.get_actions()[-self.state_history_length:]
         action_plane = self._encode_actions(actions.unsqueeze(0), self.state_history_length, resolution).squeeze(0) #(1, history_len, 16, 16)
 
@@ -183,14 +286,36 @@ class RLSystem:
         Takes in a list of actions and returns a tensor of shape (self.state_history_length, resolution[0], resolution[1])
 
         Args:
-            actions (bs, actions)
-            resolution (2): tuple of resolution
+            actions (bs, actions): the actions we want to encode (create bias plane)
+            n_actions (1,): the number of actions we want to create bias plane encoding for 
+            resolution (2): tuple of resolution for the bias plane
         """
         actions_expanded = (actions / self.n_actions)[:, :, None, None].expand(-1, -1, resolution[0], resolution[1]) #NOTE
         bias_plane = torch.ones((actions.shape[0], n_actions, resolution[0], resolution[1]), device=actions_expanded.device) *  actions_expanded
         return bias_plane
+    
+    def _encode_action_dynamics(self, action: torch.Tensor, resolution: tuple, n_actions: int):
+        """
+        Encodes a batch of actions into a tensor with n_actions planes, as per MuZero.
 
-    def _reset_environment(self):
+        Args:
+            action (torch.Tensor): Tensor of shape (batch,) containing chosen actions (integers).
+            resolution (tuple): (height, width) of the output encoding.
+            n_actions (int): Total number of possible actions.
+
+        Returns:
+            action_encoded (batch, n_actions, resolution[0], resolution[1]): One-hot encoded action planes.
+        """
+        batch_size = action.shape[0]
+        # Initialize tensor with zeros
+        action_encoded = torch.zeros(batch_size, n_actions, resolution[0], resolution[1], device=action.device)
+        # Create one-hot encoding: (batch, n_actions)
+        action_one_hot = F.one_hot(action, num_classes=n_actions).float()
+        # Tile across spatial dimensions
+        action_encoded = action_one_hot.view(batch_size, n_actions, 1, 1).expand(-1, -1, resolution[0], resolution[1])
+        return action_encoded
+
+    def _pad_initial_state(self, initial_state):
         """
         Sets the first 31 states in the trajectory to zero tensors
         
@@ -199,8 +324,9 @@ class RLSystem:
         self.observation_trajectories = []
         for idx in range(self.n_parallel):    
             observation_trajectory = ObservationTrajectory(
-                actions=[random.randint(0, 2) for _ in range(self.state_history_length)], #TODO: Maybe randomize
-                states=[torch.zeros(3, self.real_resolution[0], self.real_resolution[1]) for _ in range(self.state_history_length - 1)], #one less because we will append initial_state from env
+                actions=[0 for _ in range(self.state_history_length)],
+                # actions=[1 for _ in range(self.state_history_length)],
+                states=[initial_state[idx] for _ in range(self.state_history_length - 1)],#[torch.zeros(3, self.real_resolution[0], self.real_resolution[1]) for _ in range(self.state_history_length - 1)], #one less because we will append initial_state from env
                 rewards=[0 for _ in range(self.state_history_length)],
                 visit_counts=[torch.zeros(self.n_actions) for _ in range(self.state_history_length)],
                 values=[0.0 for _ in range(self.state_history_length)],
@@ -209,7 +335,14 @@ class RLSystem:
             )
             self.observation_trajectories.append(observation_trajectory)
 
- 
+    def load_latest_weights(self):
+        """
+        Loads the latest model weights from the learner (self.mu_zero)
+        """
+        self.mu_zero_target.load_state_dict(
+            self.mu_zero.state_dict()
+        )
+
     def _training_stage(self):
         """
         Parallel
@@ -217,9 +350,28 @@ class RLSystem:
         minibatch: set of observation trajectories
         """
         self.mu_zero.train_mode()
-        for epoch in range(self.epochs):
+
+        # num_batches = (self.num_episodes * self.n_parallel) / self.minibatch_size #cant do more than this for the first traininig iteration
+        # num_training_samples = num_batches * self.minibatch_size #number of samples we will be training on
+
+        #Step function learning rate scheduler
+        # if self.training_iteration < 10:
+        #     EPOCHS = 1
+        #     # for g in self.mu_zero.optimizer.param_groups:
+        #     #     g["lr"] = 0.0001
+        # else:
+        #     EPOCHS = self.epochs
+        #     # for g in self.mu_zero.optimizer.param_groups:
+        #     #     g["lr"] = 0.0008
+
+        EPOCHS = 1 #concept of epochs is a social construct
+        for epoch in range(EPOCHS):
             losses = []
-            for batch_start in tqdm(range(0, self.minibatch_size, len(self.replay_buffer))):
+            # sampling_idxs = torch.randperm((int(self.replay_buffer.length)))[:int(num_training_samples)]
+
+            sampling_idxs = torch.randperm(int(self.replay_buffer.length))
+            # for batch_start in tqdm(range(0, self.num_training_samples, self.minibatch_size)):
+            for batch_start in tqdm(range(0, self.num_batches * self.minibatch_size, self.minibatch_size)):
                 """
                 k_step_policies: observed visist-counts used to compare with policy_prediction at each step k in the k-step rollout
                 k_step_actions: selected actions from sample trajectory. Used for making hidden state transitions in the k-step rollout
@@ -231,51 +383,70 @@ class RLSystem:
                 #prepare data
                 with torch.no_grad():
                     batch_end = batch_start + self.minibatch_size
-                    mbs_input_actions, mbs_input_states, k_step_policies, k_step_actions, k_step_rewards, k_step_value = self._prepare_minibatch(batch_start, batch_end, device)
+                    batch_idxs = sampling_idxs[batch_start:batch_end]
+                    mbs_input_actions, mbs_input_states, k_step_policies, k_step_actions, k_step_rewards, k_step_value = self._prepare_minibatch(batch_idxs, device)
                     input_actions_encoded = self._encode_actions(mbs_input_actions, self.state_history_length, self.real_resolution) #(batch, history_len, 16, 16)
-                    k_step_actions_encoded = self._encode_actions(k_step_actions, self.K, self.latent_resolution) #these actions are used in the hidden state space (=latent_resolution)
+                    # k_step_actions_encoded = self._encode_actions(k_step_actions, self.K, self.latent_resolution) #these actions are used in the hidden state space (=latent_resolution)
                 
                 #forward pass
-                predicted_reward, predicted_value, predicted_policy = self._k_step_rollout(mbs_input_states, input_actions_encoded, k_step_actions_encoded) #(batch, K, 601), ..., (batch, K, n_actions)
-                bootstrapped_rewards = self._bootstrap_rewards(k_step_rewards, k_step_value)
-
+                predicted_reward, predicted_value, predicted_policy = self._k_step_rollout(mbs_input_states, input_actions_encoded, k_step_actions) #(batch, K, 601), ..., (batch, K, n_actions)
+                
                 #backward
                 loss = loss_fn(
                     observed_reward=k_step_rewards,
                     predicted_reward=predicted_reward,
-                    bootstrapped_reward=bootstrapped_rewards,
+                    bootstrapped_reward=k_step_value, #bootstrapped_rewards, 
                     predicted_value=predicted_value,
-                    value_counts=k_step_policies, 
+                    visit_counts=k_step_policies, 
                     predicted_policy=predicted_policy,
-                    target_transformation=self.mu_zero.rep_net._supports_representation, #TODO: improve
+                    target_transformation=self.mu_zero.rep_net._supports_representation,
                     K=self.K
                 )
 
                 losses.append(loss.item())
                 loss.backward()
                 self.mu_zero.optimizer.step()
+                self.training_step += 1
 
-            #metrics + viz
-            #mbs_input_states has shape (batch, 3*len_history, 16, 16)
-            state_sequence = mbs_input_states[0].reshape(self.state_history_length, 3, self.real_resolution[0], self.real_resolution[1]) * 255
-            # self.filewriter.add_image(f"trajectory_{epoch}", state_sequence, dataformats="NCHW")
+            # Compute metrics
+            avg_loss = mean(losses)
+            avg_reward = mean(self.replay_buffer.get_reward_sums())
 
-            # Method 1: Add images with a step dimension for slider functionality
-            for i in range(self.state_history_length):
-                # Add each frame as a separate step in the same run
-                self.filewriter.add_image(f"trajectory_{epoch}/frame", state_sequence[i], global_step=i, dataformats="CHW")
-                
-                # Also add text describing the action for this frame
-                action = int(mbs_input_actions[0][i])
-                self.filewriter.add_text(f"trajectory_{epoch}/action", f"Action: {action}", global_step=i)
+            # TensorBoard logging: Loss and Reward (PERSISTENT)
+            global_step = self.training_iteration * EPOCHS + epoch
+            self.filewriter.add_scalar("Loss/train", avg_loss, global_step=global_step) #global_step = self.training_iteration
+            # self.filewriter.add_scalar("Reward/avg", avg_reward, global_step=global_step)
+            
+            if epoch == 0 and self.training_step == 0:
+                #mbs_input_states has shape (batch, 3*len_history, 16, 16)
+                state_seq_0 = mbs_input_states[0].reshape(self.state_history_length, 3, self.real_resolution[0], self.real_resolution[1]) * 255
+                state_seq_1 = mbs_input_states[1].reshape(self.state_history_length, 3, self.real_resolution[0], self.real_resolution[1]) * 255
+                state_seq_2 = mbs_input_states[2].reshape(self.state_history_length, 3, self.real_resolution[0], self.real_resolution[1]) * 255      
+                state_seq_3 = mbs_input_states[5].reshape(self.state_history_length, 3, self.real_resolution[0], self.real_resolution[1]) * 255      
+                state_seq_4 = mbs_input_states[6].reshape(self.state_history_length, 3, self.real_resolution[0], self.real_resolution[1]) * 255      
+                # self.filewriter.add_image(f"trajectory_{epoch}", state_sequence, dataformats="NCHW")
 
-            action_sequence = mbs_input_actions[0]
-            action_log = "\n".join([f"Timestep {t}: Action {int(action_sequence[t])}" for t in range(self.state_history_length)])
-            self.filewriter.add_text("trajectory_actions_" + str(epoch), action_log)
+                for i in range(self.state_history_length):
+                    # Add each frame as a separate step in the same run
+                    image = torch.cat((state_seq_0[i], state_seq_1[i], state_seq_2[i], state_seq_3[i], state_seq_4[i]), dim=-1)
+                    self.filewriter.add_image(f"trajectory_{self.training_iteration}_{epoch}/frame", image, global_step=i, dataformats="CHW")
 
-            print(f"Epoch {epoch} loss: {mean(losses)}, mean-reward: {mean(self.replay_buffer.get_reward_sums())}")
+                action_sequence = mbs_input_actions[0]
+                action_log = "\n".join([f"Timestep {t}: Action {int(action_sequence[t])}" for t in range(self.state_history_length)])
+                self.filewriter.add_text("trajectory_actions_" + str(epoch), action_log)
 
-    def _prepare_minibatch(self, batch_start: int, batch_end: int, device: str): #TODO: no-grad???
+            print(f"Epoch {epoch} loss: {avg_loss}") # mean-reward: {avg_reward}")
+
+        # self.mu_zero.scheduler.step()
+        
+        #run test simulation with the new weights
+        self.environment.batch = 2
+        self.latent_mcts.mu_zero = self.mu_zero #make sure the latent representations are created with the latest weights
+        self.run_test_simulation(batch=2)
+        self.latent_mcts.mu_zero = self.mu_zero_target #reset to use target network
+        self.environment.batch = self.n_parallel
+
+    def _prepare_minibatch(self, batch_idxs: torch.tensor, device: str): #TODO: no-grad???
         """ 
         Needs to:
             Sample (uniformly) a current state and the previous 32 states + actions
@@ -290,14 +461,14 @@ class RLSystem:
             k_step_values (batch, K): estimated values for K states after current
         """
         #used for RepNet input
-        action_history_minibatch = self.replay_buffer.get_batched_past_actions(batch_start, batch_end)
-        state_history_minibatch = self.replay_buffer.get_batched_states(batch_start, batch_end).view(self.minibatch_size, -1, self.real_resolution[0], self.real_resolution[1])
+        action_history_minibatch = self.replay_buffer.get_batched_past_actions(batch_idxs)
+        state_history_minibatch = self.replay_buffer.get_batched_states(batch_idxs).view(self.minibatch_size, -1, self.real_resolution[0], self.real_resolution[1])
         
         #used for training loss
-        k_step_policies = self.replay_buffer.get_batched_visit_counts(batch_start, batch_end)
-        k_step_actions = self.replay_buffer.get_batched_future_actions(batch_start, batch_end) #NOTE: Tends to be mostly just 1s in the start (biased)
-        k_step_rewards = self.replay_buffer.get_batched_rewards(batch_start, batch_end)
-        k_step_values = self.replay_buffer.get_batched_values(batch_start, batch_end) 
+        k_step_policies = self.replay_buffer.get_batched_visit_counts(batch_idxs)
+        k_step_actions = self.replay_buffer.get_batched_future_actions(batch_idxs) #NOTE: Tends to be mostly just 1s in the start (biased)
+        k_step_rewards = self.replay_buffer.get_batched_rewards(batch_idxs)
+        k_step_values = self.replay_buffer.get_batched_values(batch_idxs) 
 
         return (
             action_history_minibatch.to(device),
@@ -315,7 +486,7 @@ class RLSystem:
         Args:
             input_states (batch_size, state_history_length * 3, resolution[0], resolution[1]): 
             input_actions (batch_size, state_history_length, resolution[0], resolution[1]): 
-            k_step_actions (batch_size, K, resolution[0], resolution[1]):  '
+            k_step_actions (batch_size, K)      (batch_size, K, resolution[0], resolution[1]): 
 
         Returns:
             predicted_reward (batch_size, K, 601)
@@ -336,6 +507,7 @@ class RLSystem:
                 value: (bs, 601)
             """
             policy_distribution, value = self.mu_zero.evaluate_state(hidden_state)
+            # value = self.mu_zero.rep_net.inverted_softmax_expectation(value) #NOTE: We want the model logits for the CE loss
             policy_stack.append(policy_distribution)
             value_stack.append(value)
 
@@ -344,7 +516,9 @@ class RLSystem:
                 hidden_state: (bs, ?, res, res)
                 reward: (bs, 601)
             """
-            hidden_state, reward = self.mu_zero.hidden_state_transition(hidden_state, k_step_actions[:, k, :, :].unsqueeze(1))
+            actions_encoded = self._encode_action_dynamics(k_step_actions[:, k], self.latent_resolution, self.n_actions)
+            hidden_state, reward = self.mu_zero.hidden_state_transition(hidden_state, actions_encoded) #need proper action encoding here
+            # reward = self.mu_zero.rep_net.inverted_softmax_expectation(reward)
             reward_stack.append(reward)
 
         #save shit
@@ -361,31 +535,145 @@ class RLSystem:
 
         Returns:
             bootstrapped_rewards (batch_size, K):  
-
-            [
-                sample_0: [bootstrap_0, bootstrap_1, bootstrap_2...],
-                sample_1; [bootstrap_0, bootstrap_1, bootstrap_2...],
-                ...
-            ]
         """
-        n = self.K
-        discounts = self.gamma ** torch.arange(n, device=rewards.device, dtype=rewards.dtype).view(1, 1, -1) #(1, 1, n)
-
-        rewards_repeat = rewards[:, None, :].repeat(1, n, 1) #create a new dimension with the repeated samples: (bs, K, K)
-        mask_t = torch.triu(torch.ones((self.K, self.K))).to(device) #upper triangular matrix: (K, K)
-
-        discounted_rewards = (rewards_repeat * mask_t) * discounts  
-        discounted_rewards = discounted_rewards.sum(dim=2) #(bs, K)
-
-        bootstrapped_values = values * (self.gamma ** n) #NOTE: This is wrong, this is  not v_t+n, but rather just v_t
-        bootstrapped_rewards = discounted_rewards + bootstrapped_values
-        return bootstrapped_rewards 
-
-    def _sample_observation(self) -> torch.tensor:
+        bs =  rewards.shape[0]
+        z_tk = torch.zeros((bs, self.K), device=rewards.device)
+        for k in range(self.K):
+            future_rewards = rewards[:, k:]
+            discounts = self.gamma ** torch.arange(len(future_rewards[0]), device=rewards.device)
+            discounted_rewards = (future_rewards * discounts).sum(dim=1)
+            bootstrap = (self.gamma ** (self.K - k)) * values[:, -1]
+            z_tk[:, k] = discounted_rewards + bootstrap
+        return z_tk
+    
+    def run_test_simulation(self, batch):
         """
-        Currently uses all sample observations in a Replay Buffer
-        """ 
-        return NotImplemented
+        Runs a game with the new model weights, logging it to tensorboad
+        """
+        self.mu_zero.eval_mode()
+
+        #prepare inputs
+        obs_trajectories = []
+        state, _ = self.environment.reset()[:batch]
+        valid_actions = torch.ones((batch, self.n_actions))
+        done = torch.tensor([False for _ in range(batch)])
+        for idx in range(batch):
+            observation_trajectory = ObservationTrajectory(
+                actions=[0 for _ in range(self.state_history_length)], 
+                # actions=[1 for _ in range(self.state_history_length)],
+                states=[state[idx] for _ in range(self.state_history_length - 1)],#[torch.zeros(3, self.real_resolution[0], self.real_resolution[1]) for _ in range(self.state_history_length - 1)], #one less because we will append initial_state from env
+                rewards=[0 for _ in range(self.state_history_length)],
+                visit_counts=[torch.zeros(self.n_actions) for _ in range(self.state_history_length)],
+                values=[0.0 for _ in range(self.state_history_length)],
+                length=0,
+                reward_sum=0
+            )
+            obs_trajectories.append(observation_trajectory)
+
+        #perform search
+        step_i = 0
+        while not torch.all(done == True):
+            if step_i > 150:
+                break
+            #sample action
+            repnet_inputs = []
+            for i in range(batch):
+                repnet_input = self._prepare_mcts_input(state[i], obs_trajectories[i], self.real_resolution) #.unsqueeze(0)
+                repnet_inputs.append(repnet_input)
+            hidden_state = self.mu_zero.create_hidden_state_root(torch.stack(repnet_inputs))
+            value, visit_counts = self.latent_mcts.search(hidden_state, valid_actions, self.training_iteration)
+
+            #temperature based sampling
+            # temperature = max(1.0 - (self.training_iteration * 0.005), 0.1)
+            temperature = 0.1 #0.5 #be a bit more greedy during testing
+            visit_counts_temp = visit_counts ** (1/temperature)
+            probs = visit_counts_temp / visit_counts_temp.sum(dim=1, keepdim=True)
+            # probs = probs * valid_actions
+            # probs = probs / probs.sum(dim=1, keepdim=True) #redistribute probabilities
+            action = torch.zeros(probs.shape[0], dtype=torch.long)
+
+            for i in range(probs.shape[0]):
+                dist = torch.distributions.Categorical(probs[i])
+                action[i] = dist.sample()
+
+            #step in environment
+            state, reward, done, valid_actions = self.environment.step(state, action, done)
+            
+            #write the frame
+            frame = torch.cat((state[0], state[1], state[2]), dim=-1)
+            self.filewriter.add_image(f"TEST_{self.training_iteration}/frame", frame, global_step=step_i, dataformats="CHW")
+            step_i += 1
+
+            #save to observation trajectory
+            state = state
+            for i in range(batch):
+                obs_trajectories[i].add_observation(
+                    action[0].item(), state[i], reward[i], visit_counts[i], value[i]
+                )
+
+        print("DONE")
+
+    def _save_weights(self, iteration):
+        """
+        Saves the model weights, optimizer state, and training iteration.
+        """
+        save_path = self.checkpoint_path
+        torch.save({
+            "model_state_dict": self.mu_zero.state_dict(),
+            "optimizer_state_dict": self.mu_zero.optimizer.state_dict(),  # Save optimizer state
+            "training_iteration": self.training_iteration,
+            "acting_step": self.acting_step,
+            "iteration": iteration,            
+            "replay_buffer": {
+                "past_actions_buffer": self.replay_buffer.past_actions_buffer,
+                "future_actions_buffer": self.replay_buffer.future_actions_buffer,
+                "state_buffer": self.replay_buffer.state_buffer,
+                "reward_buffer": self.replay_buffer.reward_buffer,
+                "visit_counts_buffer": self.replay_buffer.visit_counts_buffer,
+                "value_buffer": self.replay_buffer.value_buffer,
+                "reward_sums": self.replay_buffer.reward_sums,
+                "length": self.replay_buffer.length,
+                "max_length": self.replay_buffer.max_length,
+                "bootstrapped_values": self.replay_buffer.bootstrapped_values
+            }
+        }, "weights/checkptX2.pth")
+        print(f"Model weights, optimizer state, replay buffer and training iteration {self.training_iteration} saved to {save_path}")
+
+    def _load_weights(self):
+        """
+        Loads model weights, optimizer state, and training iteration.
+        """
+        if os.path.exists(self.checkpoint_path):
+            checkpoint = torch.load(self.checkpoint_path)
+            self.mu_zero.load_state_dict(checkpoint["model_state_dict"])
+            self.mu_zero.to(self.mu_zero.device)  # Ensure model is on the correct device
+            
+            #restore optimizer state
+            if "optimizer_state_dict" in checkpoint:
+                self.mu_zero.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+                print("Optimizer state restored.")
+            else:
+                print("No optimizer state found in checkpoint.")
+
+            #restore replay buffer
+            replay_data = checkpoint["replay_buffer"]
+            self.replay_buffer.past_actions_buffer = replay_data["past_actions_buffer"]
+            self.replay_buffer.future_actions_buffer = replay_data["future_actions_buffer"]
+            self.replay_buffer.state_buffer = replay_data["state_buffer"]
+            self.replay_buffer.reward_buffer = replay_data["reward_buffer"]
+            self.replay_buffer.visit_counts_buffer = replay_data["visit_counts_buffer"]
+            self.replay_buffer.value_buffer = replay_data["value_buffer"]
+            self.replay_buffer.reward_sums = replay_data["reward_sums"]
+            self.replay_buffer.length = replay_data["length"]
+            self.replay_buffer.max_length = replay_data["max_length"]
+            self.replay_buffer.bootstrapped_values = replay_data["bootstrapped_values"]
+
+            self.training_iteration = checkpoint.get("training_iteration", 0)  # Restore training iteration
+            self.acting_step = checkpoint.get("acting_step", 0)  # Restore acting step
+            self.init_iteration = checkpoint.get("iteration", 0)  # Restore initial iteration
+            print(f"Loaded model weights and training iteration {self.training_iteration} from {self.checkpoint_path}")
+        else:
+            print(f"No checkpoint found at {self.checkpoint_path}, training from scratch.")
     
 
     
