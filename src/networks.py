@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from utils import torch_activation_map
 import torch.nn.functional as F
+import torchvision.transforms as T
 
 class ConvBlock(nn.Module):
     """
@@ -126,7 +127,8 @@ class RepresentationNetwork(BaseNetwork):
                 in_channels=in_ch,
                 out_channels=latent_ch[0],
                 kernel_size=(3,3),
-                stride=1,
+                # stride=2, #NOTE: Only for ALE breakout environment
+                stride=1, 
                 padding=1
             )
         )
@@ -143,6 +145,7 @@ class RepresentationNetwork(BaseNetwork):
                 in_channels=latent_ch[0],
                 out_channels=latent_ch[1],
                 kernel_size=(3,3),
+                # stride=2, #NOTE: gym ALE environment
                 stride=1,
                 padding=1
             )
@@ -189,11 +192,12 @@ class DynamicsNetwork(BaseNetwork):
         self.num_res_blocks = cfg["dynamics_network"]["num_res_blocks"]
         activation = cfg["dynamics_network"]["activation"]
         num_supports = cfg["num_supports"] #601 supports in range [-300, 300] 
+        num_actions = cfg["dynamics_network"]["num_actions"]
         # latent_resolution = (1,1) #TODO
 
         self.conv_block = ConvBlock(
             activation=activation,
-            in_ch=in_ch + 1, # +1 for action encoding
+            in_ch=in_ch + num_actions, # +num_actions for action encoding
             out_ch=in_ch,
             stride=1
         )
@@ -357,8 +361,10 @@ class MuZeroAgent(nn.Module):
             latent_resolution=cfg["latent_resolution"] 
         )
         self.pred_net.to(self.device)
+
         self.optimizer = torch.optim.Adam(self.parameters(), lr=cfg["learning_rate"], weight_decay=0.0001)
         # self.scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lambda t: max(0.01 / 0.1, torch.exp(torch.tensor([-0.1 * t])).item())) #exponential decay
+
 
     def create_hidden_state_root(self, state: torch.tensor):
         """
@@ -367,8 +373,11 @@ class MuZeroAgent(nn.Module):
         Args:
             state (bs, state_history_length * 3 + state_history_length, resolution[0], resolution[1])
         """
-        hidden_state_0 = self.rep_net(state.to(self.device)) #NOTE: device 
-        return hidden_state_0
+        # state = self.resize_transform(state) #NOTE: These two first lines are only necessary for ALE breakout environment
+        # state = self._scale_state(state)
+        hidden_state_0 = self.rep_net(state.to(self.device)) 
+        hidden_state_0_scaled = self._scale_state(hidden_state_0)
+        return hidden_state_0_scaled
     
     def hidden_state_transition(self, prev_hidden_state: torch.tensor, action: torch.tensor):
         """
@@ -385,7 +394,8 @@ class MuZeroAgent(nn.Module):
         """
         prev_hidden_state_with_action = torch.cat([prev_hidden_state, action], dim=1)
         hidden_state, reward = self.dyn_net(prev_hidden_state_with_action)
-        return hidden_state, reward
+        hidden_state_scaled = self._scale_state(hidden_state)
+        return hidden_state_scaled, reward
     
     def evaluate_state(self, hidden_state: torch.tensor):
         """
@@ -400,6 +410,22 @@ class MuZeroAgent(nn.Module):
         """
         policy_distribution, value = self.pred_net(hidden_state)
         return policy_distribution, value
+    
+    def _scale_state(self, hidden_state: torch.tensor):
+        """
+        Returns:
+            state_scaled (batch_size, planes, latent_resolution[0], latent_resolution[1])
+        """
+        hidden_state_flat = hidden_state.view(hidden_state.shape[0], -1) #flatten along all dimensions but batch-dim so that we can reduce across all the state dimensions
+        s_min = hidden_state_flat.min(dim=1, keepdim=True)[0]
+        s_max = hidden_state_flat.max(dim=1, keepdim=True)[0]
+        
+        #reshape to make the statistics broadcastable
+        s_min = s_min.view(-1, 1, 1, 1)
+        s_max = s_max.view(-1, 1, 1, 1)
+
+        state_scaled = (hidden_state - s_min) / (s_max - s_min + 1e-8)
+        return state_scaled
     
     def _encode_action(self, action: int):
         """
@@ -429,19 +455,24 @@ if __name__ == "__main__":
     python3 -m src.networks
     """
     import yaml
+    import matplotlib.pyplot as plt
+    import numpy as np
 
     with open("config.yaml", "r") as file:
         config = yaml.safe_load(file)
 
     muzero = MuZeroAgent(config["parameters"]["model"])
 
-    hidden_state = torch.ones((32, 256, 6, 6))
-    policy_distribution, value = muzero.evaluate_state(hidden_state)
-    print(f"Policy distribution: {policy_distribution.shape}, Value: {value.shape}")
+    # hidden_state = torch.ones((32, 256, 4, 5)).to("cuda")
+    # policy_distribution, value = muzero.evaluate_state(hidden_state)
+    # print(f"Policy distribution: {policy_distribution.shape}, Value: {value.shape}")
 
-    normal_state = torch.ones(32, 128, 16, 16)
+    normal_state = torch.ones(32, 128, 16, 20).to("cuda")
     hidden_state = muzero.create_hidden_state_root(normal_state)
     print(f"Hidden sate 0: {hidden_state.shape}")
+
+    plt.imshow(np.ones((3,3)))
+    plt.show()
 
     # prev_hidden_state = hidden_state
     # action = torch.ones((32, 1, 6, 6)) 

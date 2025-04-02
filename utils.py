@@ -79,7 +79,7 @@ class ReplayBuffer: #TODO: make dataclass
     """
     Stores observation trajectory data, where each observation trajectory contains list[(action, state, reward, value_counts, value), ...]
     """
-    def __init__(self, K: int):
+    def __init__(self, seq_len: int, K: int, max_length: int, discount: float, num_rewards_to_sum: int):   
         self.past_actions_buffer = [] #action-i leading to state-i
         self.future_actions_buffer = [] 
         self.state_buffer = [] #state-i
@@ -87,9 +87,13 @@ class ReplayBuffer: #TODO: make dataclass
         self.reward_buffer = [] #reward from (state_i-1, action_i)
         self.visit_counts_buffer = []
         self.value_buffer = [] #estimated value at state-i
-        self.hist_seq_len = 32 #includes the root state
+        self.hist_seq_len = seq_len #includes the root state
         self.K = K
         self.length = 0
+        self.max_length = max_length
+        self.bootstrapped_values = []
+        self.discount = discount
+        self.num_rewards_to_sum = num_rewards_to_sum
 
     def save_observation_trajectory(self, observation_trajectory: ObservationTrajectory): 
         """
@@ -100,85 +104,132 @@ class ReplayBuffer: #TODO: make dataclass
         Args:
             observation: (action, state, reward, visit_counts, value)
         """
-        state_start = torch.randint(self.hist_seq_len, self.hist_seq_len + observation_trajectory.length - self.K, (1,)).item() 
-        trajectory_start = state_start - self.hist_seq_len  #TODO: Wrong   <----- Current code can train on initial padded history only
+        # if observation_trajectory.length > 40: #no need to sample from earlier states then (NOTE: can lead to catastrophic forgetting when the agent becomes very good)
+        #     state_start = torch.randint(self.hist_seq_len*2, self.hist_seq_len*2 + (observation_trajectory.length - self.hist_seq_len) - self.K, (1,)).item()
+        # else:
+        #     state_start = torch.randint(self.hist_seq_len, self.hist_seq_len + observation_trajectory.length - self.K + 1, (1,)).item() #NOTE: +1 makes it so we can actually get the negative reward 
 
-        #used for trajectory history (RepNet input)
-        self.past_actions_buffer.append(
-            #select a fixed length of actions from the trajectory such that this returned list can be tensorized
-            observation_trajectory.get_actions()[trajectory_start : state_start] #NOTE 
-        )
-        self.future_actions_buffer.append(
-            observation_trajectory.get_actions()[state_start : state_start + self.K]
-        )
-        self.state_buffer.append(
-            #each observation trajectory is a fixed length
-            observation_trajectory.get_states()[trajectory_start : state_start]
-        )
+        # trajectory_start = state_start - self.hist_seq_len  #TODO: Wrong   <----- Current code can train on initial padded history only
 
-        #save rewards for metrics
-        self.reward_sums.append(observation_trajectory.get_reward_sum().item()) #no need to index because we want all the collected rewards
+        #create a sample of every state in the observation trajectory
+        for state in range(observation_trajectory.length - self.K + 1):
+            state_start = state + self.hist_seq_len
+            trajectory_start = state_start - self.hist_seq_len
+            
+            self.past_actions_buffer.append(
+                #select a fixed length of actions from the trajectory such that this returned list can be tensorized
+                observation_trajectory.get_actions()[trajectory_start : state_start] 
+            )
+            self.future_actions_buffer.append(
+                observation_trajectory.get_actions()[state_start : state_start + self.K]
+            )
+            self.state_buffer.append(
+                #each observation trajectory is a fixed length
+                observation_trajectory.get_states()[trajectory_start : state_start]
+            )
 
-        #used for k-step rollout
-        self.reward_buffer.append(
-            observation_trajectory.get_rewards()[state_start : state_start + self.K]
-        )
-        self.visit_counts_buffer.append(
-            observation_trajectory.get_visit_counts()[state_start : state_start + self.K]
-        )
-        self.value_buffer.append(
-            observation_trajectory.get_values()[state_start : state_start + self.K]
-        )
+            #save rewards for metrics
+            self.reward_sums.append(observation_trajectory.get_reward_sum().item()) #no need to index because we want all the collected rewards
 
-        self.length += 1
+            #used for k-step rollout
+            self.reward_buffer.append(
+                observation_trajectory.get_rewards()[state_start : state_start + self.K]
+            )
+            self.visit_counts_buffer.append(
+                observation_trajectory.get_visit_counts()[state_start : state_start + self.K]
+            )
+            self.value_buffer.append(
+                observation_trajectory.get_values()[state_start : state_start + self.K]
+            )
+            
+            #create value targets
+            td_steps = 10
+            max_length = self.hist_seq_len + observation_trajectory.length
+            bootstrap_idx = state_start + td_steps
+            bootstrapped_values_sample = []
+            for current_idx in range(state_start, state_start + self.K):
+                if (bootstrap_idx < max_length):
+                    value_target = observation_trajectory.get_values()[bootstrap_idx] * self.discount**self.K       #NOTE It is correct to use [bootstrap_idx] and not [bootstrap_idx-1] because the mcts-value is saved along with its successor state
+                    for k, reward in enumerate(observation_trajectory.get_rewards()[current_idx : bootstrap_idx]):
+                        value_target += self.discount**k * reward
+                else:
+                    value_target = 0.0
+                    for k, reward in enumerate(observation_trajectory.get_rewards()[current_idx : max_length]):
+                        value_target += self.discount**k * reward
+        
+                bootstrapped_values_sample.append(value_target.item())
+                bootstrap_idx += 1
+            self.bootstrapped_values.append(torch.tensor(bootstrapped_values_sample)) #NOTE: Forgot to pop these!
 
-    def get_batched_past_actions(self, batch_start: int, batch_end: int):
+            self.length += 1
+            if self.length > self.max_length:
+                self.past_actions_buffer.pop(0)
+                self.future_actions_buffer.pop(0)
+                self.state_buffer.pop(0)
+                self.reward_buffer.pop(0)
+                self.visit_counts_buffer.pop(0)
+                self.value_buffer.pop(0)
+                self.reward_sums.pop(0)
+                self.bootstrapped_values.pop(0)
+                self.length -= 1
+                
+    def get_batched_past_actions(self, batch_idxs: torch.tensor):
         """
         Returns actions used as input to RepNet
 
         Returns:
             tensor[]: tensor[batch_size, fixed_trajectory_length]
         """
-        return torch.stack(self.past_actions_buffer[batch_start:batch_end])
+        # return torch.stack(self.past_actions_buffer[batch_start:batch_end])
+        return torch.stack([self.past_actions_buffer[i] for i in batch_idxs.tolist()])
 
-    def get_batched_future_actions(self, batch_start: int, batch_end: int):
+    def get_batched_future_actions(self, batch_idxs: torch.tensor):
         """
         Returns actions used k-step rollout
         """
-        return torch.stack(self.future_actions_buffer[batch_start:batch_end])
+        # return torch.stack(self.future_actions_buffer[batch_start:batch_end])
+        return torch.stack([self.future_actions_buffer[i] for i in batch_idxs.tolist()])
 
-    def get_batched_states(self, batch_start: int, batch_end: int):
+    def get_batched_states(self, batch_idxs: torch.tensor):
         """
         Returns a list of state-sequences[]
 
         Returns:
             tensor[]: tensor[batch_size, fixed_trajectory_length, channels, resolution[0], resolution[1]]
         """
-        return torch.stack(self.state_buffer[batch_start:batch_end]) #(batch_size, fixed, channels, resolution[1], resolution[2])
-        
-    def get_batched_rewards(self, batch_start: int, batch_end: int):
+        # return torch.stack(self.state_buffer[batch_start:batch_end]) #(batch_size, fixed, channels, resolution[1], resolution[2])
+        return torch.stack([self.state_buffer[i] for i in batch_idxs.tolist()])
+
+    def get_batched_rewards(self, batch_idxs: torch.tensor):
         """
         Returns:
             tensor[]: tensor[batch_size, K] 
         """
-        return torch.stack(self.reward_buffer[batch_start:batch_end])
+        # return torch.stack(self.reward_buffer[batch_start:batch_end])
+        return torch.stack([self.reward_buffer[i] for i in batch_idxs.tolist()])
 
-    def get_batched_visit_counts(self, batch_start: int, batch_end: int):
+    def get_batched_visit_counts(self, batch_idxs: torch.tensor):
         """
         Returns:
-            tensor[]: tensor[batch_size, K, n_actions] 
+            tensor[]: tensor[batch_size, K, n_actions]
         """
-        return torch.stack(self.visit_counts_buffer[batch_start:batch_end]) 
+        # return torch.stack(self.visit_counts_buffer[batch_start:batch_end]) 
+        return torch.stack([self.visit_counts_buffer[i] for i in batch_idxs.tolist()])
 
-    def get_batched_values(self, batch_start: int, batch_end: int):
+    def get_batched_values(self, batch_idxs: torch.tensor):
         """
         Returns:
             tensor[]: [batch_size, K, 1] 
         """
-        return torch.stack(self.value_buffer[batch_start:batch_end])
-    
+        # return torch.stack(self.value_buffer[batch_start:batch_end])
+        # return torch.stack([self.value_buffer[i] for i in batch_idxs.tolist()])
+        return torch.stack([self.bootstrapped_values[i] for i in batch_idxs.tolist()])
+
     def get_reward_sums(self):
-        return self.reward_sums
+        """
+        Gives the reward sums for the last 512 samples (newest episode generation stage)
+        """
+        return self.reward_sums[-self.num_rewards_to_sum:]
 
     def empty_buffer(self):
         """
@@ -190,8 +241,8 @@ class ReplayBuffer: #TODO: make dataclass
         self.reward_buffer = [] #reward from (state_i-1, action_i)
         self.visit_counts_buffer = []
         self.value_buffer = [] #estimated value at state-i
-        self.hist_seq_len = 32 #includes the root state
         self.length = 0
+        self.bootstrapped = []
 
     def __len__(self):
         return self.length

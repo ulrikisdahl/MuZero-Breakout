@@ -51,7 +51,7 @@ def loss_fn(
         F.log_softmax(predicted_policy.view(-1, predicted_policy.shape[-1]), dim=-1),
         visit_counts_normalized.view(-1, visit_counts_normalized.shape[-1])
     )
-    return (1/K) * (reward_loss + value_loss + policy_loss) #TODO: Add regularizing term
+    return (1/K) * (reward_loss + value_loss + policy_loss), reward_loss, value_loss, policy_loss
 
 
 class RLSystem:
@@ -181,7 +181,7 @@ class RLSystem:
         length_counter = 0
         while not torch.all(done_mask == True):
 
-            if length_counter > 200:
+            if length_counter > 220:
                 break
             
             value, visit_counts = self._sample_action(state, valid_actions) #v, π
@@ -209,12 +209,6 @@ class RLSystem:
                     )
             prev_done_mask = done_mask.clone()
 
-            """
-            CRUICAL:
-                Certain games get the ball behind the brick wall very early and this makes them last MUCH longer (too long)
-            """
-            # if length_counter > 102:
-            #     break
             length_counter += 1
             self.action_stats = torch.cat((self.action_stats, action), dim=0)
 
@@ -325,7 +319,6 @@ class RLSystem:
         for idx in range(self.n_parallel):    
             observation_trajectory = ObservationTrajectory(
                 actions=[0 for _ in range(self.state_history_length)],
-                # actions=[1 for _ in range(self.state_history_length)],
                 states=[initial_state[idx] for _ in range(self.state_history_length - 1)],#[torch.zeros(3, self.real_resolution[0], self.real_resolution[1]) for _ in range(self.state_history_length - 1)], #one less because we will append initial_state from env
                 rewards=[0 for _ in range(self.state_history_length)],
                 visit_counts=[torch.zeros(self.n_actions) for _ in range(self.state_history_length)],
@@ -350,19 +343,6 @@ class RLSystem:
         minibatch: set of observation trajectories
         """
         self.mu_zero.train_mode()
-
-        # num_batches = (self.num_episodes * self.n_parallel) / self.minibatch_size #cant do more than this for the first traininig iteration
-        # num_training_samples = num_batches * self.minibatch_size #number of samples we will be training on
-
-        #Step function learning rate scheduler
-        # if self.training_iteration < 10:
-        #     EPOCHS = 1
-        #     # for g in self.mu_zero.optimizer.param_groups:
-        #     #     g["lr"] = 0.0001
-        # else:
-        #     EPOCHS = self.epochs
-        #     # for g in self.mu_zero.optimizer.param_groups:
-        #     #     g["lr"] = 0.0008
 
         EPOCHS = 1 #concept of epochs is a social construct
         for epoch in range(EPOCHS):
@@ -392,7 +372,7 @@ class RLSystem:
                 predicted_reward, predicted_value, predicted_policy = self._k_step_rollout(mbs_input_states, input_actions_encoded, k_step_actions) #(batch, K, 601), ..., (batch, K, n_actions)
                 
                 #backward
-                loss = loss_fn(
+                (loss, reward_loss, value_loss, policy_loss) = loss_fn(
                     observed_reward=k_step_rewards,
                     predicted_reward=predicted_reward,
                     bootstrapped_reward=k_step_value, #bootstrapped_rewards, 
@@ -415,6 +395,9 @@ class RLSystem:
             # TensorBoard logging: Loss and Reward (PERSISTENT)
             global_step = self.training_iteration * EPOCHS + epoch
             self.filewriter.add_scalar("Loss/train", avg_loss, global_step=global_step) #global_step = self.training_iteration
+            self.filewriter.add_scalar("Loss/reward", reward_loss, global_step=global_step)
+            self.filewriter.add_scalar("Loss/value", value_loss, global_step=global_step)
+            self.filewriter.add_scalar("Loss/policy", policy_loss, global_step=global_step)
             # self.filewriter.add_scalar("Reward/avg", avg_reward, global_step=global_step)
             
             if epoch == 0 and self.training_step == 0:
@@ -572,44 +555,48 @@ class RLSystem:
 
         #perform search
         step_i = 0
-        while not torch.all(done == True):
-            if step_i > 150:
-                break
-            #sample action
-            repnet_inputs = []
-            for i in range(batch):
-                repnet_input = self._prepare_mcts_input(state[i], obs_trajectories[i], self.real_resolution) #.unsqueeze(0)
-                repnet_inputs.append(repnet_input)
-            hidden_state = self.mu_zero.create_hidden_state_root(torch.stack(repnet_inputs))
-            value, visit_counts = self.latent_mcts.search(hidden_state, valid_actions, self.training_iteration)
+        with torch.no_grad():
+            while not torch.all(done == True):
+                if step_i > 150:
+                    break
+                #sample action
+                repnet_inputs = []
+                for i in range(batch):
+                    repnet_input = self._prepare_mcts_input(state[i], obs_trajectories[i], self.real_resolution) #.unsqueeze(0)
+                    repnet_inputs.append(repnet_input)
+                hidden_state = self.mu_zero.create_hidden_state_root(torch.stack(repnet_inputs))
+                value, visit_counts = self.latent_mcts.search(hidden_state, valid_actions, self.training_iteration)
 
-            #temperature based sampling
-            # temperature = max(1.0 - (self.training_iteration * 0.005), 0.1)
-            temperature = 0.1 #0.5 #be a bit more greedy during testing
-            visit_counts_temp = visit_counts ** (1/temperature)
-            probs = visit_counts_temp / visit_counts_temp.sum(dim=1, keepdim=True)
-            # probs = probs * valid_actions
-            # probs = probs / probs.sum(dim=1, keepdim=True) #redistribute probabilities
-            action = torch.zeros(probs.shape[0], dtype=torch.long)
+                #temperature based sampling
+                # temperature = max(1.0 - (self.training_iteration * 0.005), 0.1)
+                temperature = 0.1 #0.5 #be a bit more greedy during testing
+                visit_counts_temp = visit_counts ** (1/temperature)
+                probs = visit_counts_temp / visit_counts_temp.sum(dim=1, keepdim=True)
+                # probs = probs * valid_actions
+                # probs = probs / probs.sum(dim=1, keepdim=True) #redistribute probabilities
+                action = torch.zeros(probs.shape[0], dtype=torch.long)
 
-            for i in range(probs.shape[0]):
-                dist = torch.distributions.Categorical(probs[i])
-                action[i] = dist.sample()
+                for i in range(probs.shape[0]):
+                    dist = torch.distributions.Categorical(probs[i])
+                    action[i] = dist.sample()
 
-            #step in environment
-            state, reward, done, valid_actions = self.environment.step(state, action, done)
-            
-            #write the frame
-            frame = torch.cat((state[0], state[1], state[2]), dim=-1)
-            self.filewriter.add_image(f"TEST_{self.training_iteration}/frame", frame, global_step=step_i, dataformats="CHW")
-            step_i += 1
+                #step in environment
+                state, reward, done, valid_actions = self.environment.step(state, action, done)
+                
+                #write the frame
+                frame = torch.cat((state[0], state[1]), dim=-1) # state[2]), dim=-1)
+                self.filewriter.add_image(f"TEST_{self.training_iteration}/frame", frame, global_step=step_i, dataformats="CHW")
+                step_i += 1
 
-            #save to observation trajectory
-            state = state
-            for i in range(batch):
-                obs_trajectories[i].add_observation(
-                    action[0].item(), state[i], reward[i], visit_counts[i], value[i]
-                )
+                #save to observation trajectory
+                state = state
+                for i in range(batch):
+                    obs_trajectories[i].add_observation(
+                        action[0].item(), state[i], reward[i], visit_counts[i], value[i]
+                    )
+
+        #cleanup
+        del obs_trajectories, state, hidden_state, repnet_input, value, visit_counts
 
         print("DONE")
 

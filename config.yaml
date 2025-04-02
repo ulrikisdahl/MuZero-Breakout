@@ -1,52 +1,55 @@
 parameters:
-  num_iterations: 30 #number of total runs
+  num_iterations: 50000 #number of total runs
   training_interval: 0 #not used
-  num_episodes: 16 #16 #number of n_parallel*epiosode iterations (each creates n_parallel episodes) <--- N-Batches
+  num_episodes: 2 #16 #number of n_parallel*epiosode iterations (each creates n_parallel episodes) <--- N-Batches
   num_steps: 0
   num_unroll_steps: 5  #K
   num_simulations: 30 #21 #in MCTS
   epochs: 4
   d_max: 0 #max search depth
   actions: [0, 1, 2]
-  minibatch_size: 128 #depends on num_episodes
-  discount_factor: 0.98
-  latent_resolution: [4, 4]
-  real_resolution: [16, 16]
+  minibatch_size: 512 #depends on num_episodes
+  num_batches: 15
+  discount_factor: 0.985
+  latent_resolution: [4, 5]
+  real_resolution: [16, 20]
   n_parallel: 32 #should be 32
 
-  replay_buffer_max: 50000 #512 * 7 (we create 16*32=512 episodes per iter)
+  
+  samples_before_train: 35000
+  replay_buffer_max: 70000 #512 * 7 (we create 16*32=512 episodes per iter)
 
   load_weights: False
-  checkpoint_path: "weights/checkpt1.pth"
+  checkpoint_path: "weights/checkptX2.pth"
 
   search:
     mcts_name: "MCTSSearchVec" #"MCTSSearch"
     c1: 1.25
     c2: 19652.0   
-    discount_factor: 0.98
+    discount_factor: 0.985
 
   model:
-    learning_rate: 0.001 # 0.001
+    learning_rate: 0.0002 # 0.001
     agent_name: "MuZeroAgent"
     num_supports: 11 #for support integers in [-300, 300] (paper page 14)
     supports_min: -5
     supports_max: 5
     latent_channels: [128, 256] #number of channels we use in the latent space 
-    state_history_length: 20 #Should be at least 20 - this is the number of steps it takes to see a whole game from start to finish (requires padding history-len)
+    state_history_length: 32 #Should be at least 20 - this is the number of steps it takes to see a whole game from start to finish (requires padding history-len)
     device: "cuda"
-    latent_resolution: [4, 4] #Redundant
+    latent_resolution: [4, 5] #Redundant
 
     representation_network:
-      num_res_blocks: [1, 2, 2]
+      num_res_blocks: [2, 3, 3]
       activation: "relu"
 
     dynamics_network:
-      num_res_blocks: 4
+      num_res_blocks: 10
       num_actions: 3
       activation: "relu"
 
     prediction_network:
-      num_res_blocks: 4
+      num_res_blocks: 10
       num_actions: 3
       activation: "relu" #activation for conv block   
 
@@ -58,7 +61,7 @@ parameters:
     resolution: [16, 16] #[height, width]
     brick_rows: 5
     n_parallel: 32
-    paddle_hit_reward: 1.0 #1.0
+    paddle_hit_reward: 0.0 #1.0
     brick_hit_reward: 1.0 
     game_lost_reward: -1.0
     game_won_reward: 5.0
