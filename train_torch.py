@@ -47,9 +47,10 @@ def loss_fn(
     )
 
     visit_counts_normalized = visit_counts / visit_counts.sum(dim=-1, keepdim=True)
-    policy_loss = policy_loss_fn(
+    policy_loss = F.kl_div( #NOTE: Used to be nn.CrossentropyLoss (policy_loss_fn)
         F.log_softmax(predicted_policy.view(-1, predicted_policy.shape[-1]), dim=-1),
-        visit_counts_normalized.view(-1, visit_counts_normalized.shape[-1])
+        visit_counts_normalized.view(-1, visit_counts_normalized.shape[-1]),
+        reduction="batchmean"
     )
     return (1/K) * (reward_loss + value_loss + policy_loss), reward_loss, value_loss, policy_loss
 
@@ -122,14 +123,19 @@ class RLSystem:
             """
             iteration BURDE BEGYNNE Å TELLE FRA DA TRENING HAR BEGYNT!
             """
-            if self.training_iteration == 200:
-                #make agent a little more greedy
-                self.temperature = 0.5
+            if self.training_iteration > 10:
+                #start temperature decay
+                self.temperature *= 0.996
+                self.temperature = max(self.temperature, 0.1)
+                
+            if self.training_iteration == 100: 
                 self.latent_mcts.initial_noise_weight = 0.14
 
-            if self.training_iteration == 300:
-                self.temperature = 0.3
+            if self.training_iteration == 200:
                 self.latent_mcts.initial_noise_weight = 0.1
+
+            if self.training_iteration == 300:
+                self.latent_mcts.initial_noise_weight = 0.0
 
             if iteration % 15 == 0 and iteration != 0 and started_training:
                 self.load_latest_weights() #update Target Network
@@ -161,7 +167,7 @@ class RLSystem:
         self.mu_zero_target.eval_mode()
         for episode in tqdm(range(self.num_episodes)):
             initial_state, done = self.environment.reset()
-            self._pad_initial_state(initial_state) #resets self.observation_trajectories
+            self._pad_initial_state(self.convert_to_grayscale(initial_state)) #resets self.observation_trajectories
 
             self._run_episode(initial_state)
 
@@ -171,20 +177,19 @@ class RLSystem:
 
         Args:
             state (batch_size, 3, 16, 16)
-        """
-        # temperature = min(max(1.0 - ((self.training_iteration - 9) * 0.02), 0.2), 1.0) #temperature annealing
-        
+        """        
         done_mask = torch.zeros((state.shape[0]), dtype=torch.bool)
         prev_done_mask = done_mask
         valid_actions = torch.ones((state.shape[0], self.n_actions)) #TODO: Could introduce some randomization here
+        warp_state = self.convert_to_grayscale(state)
 
         length_counter = 0
         while not torch.all(done_mask == True):
 
-            if length_counter > 220:
+            if length_counter > 260:
                 break
             
-            value, visit_counts = self._sample_action(state, valid_actions) #v, π
+            value, visit_counts = self._sample_action(warp_state, valid_actions) #v, π
 
             #temperature based sampling
             visit_counts_temp = visit_counts ** (1/self.temperature)
@@ -201,11 +206,11 @@ class RLSystem:
 
             state, reward, done_mask, valid_actions = self.environment.step(state, action, done_mask)
 
-            save_state = state
+            warp_state = self.convert_to_grayscale(state)
             for idx in range(len(self.observation_trajectories)):
                 if not prev_done_mask[idx]: #game is not finished
                     self.observation_trajectories[idx].add_observation(
-                        action[idx], save_state[idx], reward[idx], visit_counts[idx], value[idx] #value and visit_counts are for previous state
+                        action[idx], warp_state[idx], reward[idx], visit_counts[idx], value[idx] #value and visit_counts are for previous state
                     )
             prev_done_mask = done_mask.clone()
 
@@ -327,6 +332,33 @@ class RLSystem:
                 reward_sum=0
             )
             self.observation_trajectories.append(observation_trajectory)
+
+    def convert_to_grayscale(self, state: torch.Tensor) -> torch.Tensor:
+        """
+        Converts a (batch, 3, height, width) breakout state to a (batch, 1, height, width) grayscale version.
+
+        Args:
+            state (torch.Tensor): The original 3-channel state tensor.
+
+        Returns:
+            torch.Tensor: Grayscale tensor with 1 channel per state.
+        """
+        # Define grayscale intensities for each channel
+        paddle_intensity = 0.3
+        ball_intensity = 1.0
+        brick_intensity = 0.6
+
+        # Split channels
+        paddle = state[:, 0] * paddle_intensity
+        ball   = state[:, 1] * ball_intensity
+        bricks = state[:, 2] * brick_intensity
+
+        # Combine to single channel
+        grayscale = paddle + ball + bricks
+        grayscale = grayscale.clamp(0, 1).unsqueeze(1)  # Add channel dim back: (batch, 1, height, width)
+
+        return grayscale
+
 
     def load_latest_weights(self):
         """
@@ -529,6 +561,7 @@ class RLSystem:
             z_tk[:, k] = discounted_rewards + bootstrap
         return z_tk
     
+
     def run_test_simulation(self, batch):
         """
         Runs a game with the new model weights, logging it to tensorboad
@@ -538,13 +571,14 @@ class RLSystem:
         #prepare inputs
         obs_trajectories = []
         state, _ = self.environment.reset()[:batch]
+        warp_state = self.convert_to_grayscale(state)
         valid_actions = torch.ones((batch, self.n_actions))
         done = torch.tensor([False for _ in range(batch)])
         for idx in range(batch):
             observation_trajectory = ObservationTrajectory(
-                actions=[0 for _ in range(self.state_history_length)], 
-                # actions=[1 for _ in range(self.state_history_length)],
-                states=[state[idx] for _ in range(self.state_history_length - 1)],#[torch.zeros(3, self.real_resolution[0], self.real_resolution[1]) for _ in range(self.state_history_length - 1)], #one less because we will append initial_state from env
+                # actions=[0 for _ in range(self.state_history_length)], 
+                actions=[1 for _ in range(self.state_history_length)],
+                states=[warp_state[idx] for _ in range(self.state_history_length - 1)],#[torch.zeros(3, self.real_resolution[0], self.real_resolution[1]) for _ in range(self.state_history_length - 1)], #one less because we will append initial_state from env
                 rewards=[0 for _ in range(self.state_history_length)],
                 visit_counts=[torch.zeros(self.n_actions) for _ in range(self.state_history_length)],
                 values=[0.0 for _ in range(self.state_history_length)],
@@ -557,12 +591,12 @@ class RLSystem:
         step_i = 0
         with torch.no_grad():
             while not torch.all(done == True):
-                if step_i > 150:
+                if step_i > 200:
                     break
                 #sample action
                 repnet_inputs = []
                 for i in range(batch):
-                    repnet_input = self._prepare_mcts_input(state[i], obs_trajectories[i], self.real_resolution) #.unsqueeze(0)
+                    repnet_input = self._prepare_mcts_input(warp_state[i], obs_trajectories[i], self.real_resolution) #.unsqueeze(0)
                     repnet_inputs.append(repnet_input)
                 hidden_state = self.mu_zero.create_hidden_state_root(torch.stack(repnet_inputs))
                 value, visit_counts = self.latent_mcts.search(hidden_state, valid_actions, self.training_iteration)
@@ -582,17 +616,17 @@ class RLSystem:
 
                 #step in environment
                 state, reward, done, valid_actions = self.environment.step(state, action, done)
+                warp_state = self.convert_to_grayscale(state)
                 
                 #write the frame
-                frame = torch.cat((state[0], state[1]), dim=-1) # state[2]), dim=-1)
+                frame = torch.cat((warp_state[0], warp_state[1]), dim=-1) # state[2]), dim=-1)
                 self.filewriter.add_image(f"TEST_{self.training_iteration}/frame", frame, global_step=step_i, dataformats="CHW")
                 step_i += 1
 
                 #save to observation trajectory
-                state = state
                 for i in range(batch):
                     obs_trajectories[i].add_observation(
-                        action[0].item(), state[i], reward[i], visit_counts[i], value[i]
+                        action[0].item(), warp_state[i], reward[i], visit_counts[i], value[i]
                     )
 
         #cleanup

@@ -342,7 +342,7 @@ class PredictionNetwork(BaseNetwork):
 class MuZeroAgent(nn.Module):
     def __init__(self, cfg: dict):
         super(MuZeroAgent, self).__init__()
-        real_state_planes = cfg["state_history_length"] * 3 + cfg["state_history_length"] #representation function input (page: 13)
+        real_state_planes = cfg["state_history_length"] * 1 + cfg["state_history_length"] #representation function input (page: 13)
         self.device = "cuda" #cfg["device"]
         self.rep_net = RepresentationNetwork(
             cfg=cfg,
