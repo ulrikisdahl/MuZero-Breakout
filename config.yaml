@@ -63,5 +63,5 @@ parameters:
     n_parallel: 24
     paddle_hit_reward: 0.0 #1.0
     brick_hit_reward: 1.0 
-    game_lost_reward: -1.0
+    game_lost_reward: -1.0 #0.0
     game_won_reward: 5.0
