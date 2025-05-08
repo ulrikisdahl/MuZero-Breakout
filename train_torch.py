@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import yaml
-from utils import get_class, ReplayBuffer, ObservationTrajectory
+from utils import get_class, ReplayBuffer, ObservationTrajectory, ScalarTransforms
 from tqdm import tqdm
 from statistics import mean
 import random
@@ -9,13 +9,29 @@ from datetime import datetime
 from torch.utils.tensorboard import SummaryWriter 
 import os
 import torch.nn.functional as F
+import numpy as np
 
 reward_loss_fn = nn.NLLLoss() #used instead of CrossentropyLoss because the model outputs softmax probs
 value_loss_fn = nn.NLLLoss # nn.NLLLoss(log(softmax(logits)), ...) == nn.CrossEntropyLoss(logits, ...)
-policy_loss_fn = nn.CrossEntropyLoss()
+ce_loss_fn = nn.CrossEntropyLoss()
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+def set_seed(seed: int = 42):
+    """
+    Sets seeds for reproducibility across Python, NumPy, and PyTorch.
+
+    Args:
+        seed (int): The seed value to use for RNGs.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)  # if using multi-GPU
+    # Ensures deterministic behavior (can slow down training)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+set_seed(42) 
 
 def loss_fn(
         observed_reward: torch.tensor, 
@@ -59,7 +75,7 @@ class RLSystem:
     def __init__(self, cfg: dict):
         #hyperparams
         self.num_episodes = cfg["num_episodes"]
-        self.num_steps = cfg["num_steps"] #??
+        self.num_steps = cfg["num_steps"] 
         self.num_simulations = cfg["num_simulations"]
         self.minibatch_size = cfg["minibatch_size"]
         self.real_resolution = cfg["real_resolution"]
@@ -73,18 +89,19 @@ class RLSystem:
         self.epochs = cfg["epochs"]
         self.n_parallel = cfg["n_parallel"]
         self.temperature = 1.0
+        self.max_steps_test = 200
 
         #internal classes
         mu_zero_class = get_class("src.networks", cfg["model"]["agent_name"])
         self.mu_zero = mu_zero_class(cfg["model"]) 
         self.mu_zero_target = mu_zero_class(cfg["model"]) #Target Network
         self.mu_zero_target.load_state_dict(self.mu_zero.state_dict())
-        latent_mcts_class = get_class("src.parallel_mcts", cfg["search"]["mcts_name"])
-        # latent_mcts_class = get_class("src.parallel_mcts_2", cfg["search"]["mcts_name"])
-        self.latent_mcts = latent_mcts_class(cfg, self.mu_zero_target) #NOTE: passing the networks like this is not good
+        # latent_mcts_class = get_class("src.parallel_mcts", cfg["search"]["mcts_name"])
+        latent_mcts_class = get_class("src.parallel_mcts_2", cfg["search"]["mcts_name"])
+        self.scalar_transforms = ScalarTransforms(cfg["model"])
+        self.latent_mcts = latent_mcts_class(cfg, self.mu_zero_target, self.scalar_transforms) #NOTE: passing the networks like this is not good
         environment_class = get_class(cfg["environment"]["environment_path"], cfg["environment"]["environment_name"])
         self.environment = environment_class(cfg["environment"]) 
-        # self.environment = environment_class(cfg["n_parallel"], "cpu") #NOTE: Gym ALE breakout
 
         #Disable gradients for Target Network
         for param in self.mu_zero_target.parameters():
@@ -114,6 +131,7 @@ class RLSystem:
             self._load_weights()
 
         self.mcts_iter = 0
+        self.saved_weights = 0
 
     def train(self):
         """
@@ -121,7 +139,7 @@ class RLSystem:
         started_training = False
         for iteration in range(self.init_iteration, 50000):
             """
-            iteration BURDE BEGYNNE Å TELLE FRA DA TRENING HAR BEGYNT!
+            
             """
             if self.training_iteration > 10:
                 #start temperature decay
@@ -129,13 +147,13 @@ class RLSystem:
                 self.temperature = max(self.temperature, 0.1)
                 
             if self.training_iteration == 100: 
-                self.latent_mcts.initial_noise_weight = 0.14
+                self.latent_mcts.noise_weight = 0.14
 
             if self.training_iteration == 200:
-                self.latent_mcts.initial_noise_weight = 0.1
+                self.latent_mcts.noise_weight = 0.1
 
             if self.training_iteration == 300:
-                self.latent_mcts.initial_noise_weight = 0.0
+                self.latent_mcts.noise_weight = 0.0
 
             if iteration % 15 == 0 and iteration != 0 and started_training:
                 self.load_latest_weights() #update Target Network
@@ -147,7 +165,7 @@ class RLSystem:
 
             #network training
             print(f"TRAINING STAGE {iteration}")
-            if self.replay_buffer.length > self.samples_before_train:
+            if self.replay_buffer.length > self.samples_before_train or 1:
                 self._training_stage()
                 self.training_iteration += 1
                 started_training = True
@@ -180,7 +198,7 @@ class RLSystem:
         """        
         done_mask = torch.zeros((state.shape[0]), dtype=torch.bool)
         prev_done_mask = done_mask
-        valid_actions = torch.ones((state.shape[0], self.n_actions)) #TODO: Could introduce some randomization here
+        valid_actions = torch.ones((state.shape[0], self.n_actions)) 
         warp_state = self.convert_to_grayscale(state)
 
         length_counter = 0
@@ -194,15 +212,12 @@ class RLSystem:
             #temperature based sampling
             visit_counts_temp = visit_counts ** (1/self.temperature)
             probs = visit_counts_temp / visit_counts_temp.sum(dim=1, keepdim=True)
-            # probs = probs * valid_actions
-            # probs = probs / probs.sum(dim=1, keepdim=True) #redistribute probabilities
             action = torch.zeros(probs.shape[0], dtype=torch.long)
 
             for i in range(probs.shape[0]):
                 dist = torch.distributions.Categorical(probs[i])
                 action[i] = dist.sample()
 
-            # action = torch.argmax(visit_counts, dim=1)
 
             state, reward, done_mask, valid_actions = self.environment.step(state, action, done_mask)
 
@@ -219,11 +234,10 @@ class RLSystem:
 
         episode_lens = [obs.length for obs in self.observation_trajectories]
         max_len = max(episode_lens)
-        avg_len = mean(episode_lens)
+        avg_len = mean(episode_lens) 
         value_counts = torch.bincount(self.action_stats.long(), minlength=self.n_actions)
         print(f"Max episode length: {max_len}, Average episode length: {avg_len}")
         print(f"Value counts 0: {value_counts[0]}, 1: {value_counts[1]}, 2: {value_counts[2]}")
-        # print(f"Value counts 0: {value_counts[0]}, 1: {value_counts[1]}, 2: {value_counts[2]}, 3: {value_counts[3]}")
         for observation_trajectory in self.observation_trajectories:
             if observation_trajectory.length > (self.K + 1):
                 self.replay_buffer.save_observation_trajectory(observation_trajectory)
@@ -233,6 +247,9 @@ class RLSystem:
         
         rewards = self.replay_buffer.get_reward_sums()
         avg_reward = mean(rewards)
+        if avg_reward > 9:
+            self._save_weights(0, self.saved_weights)
+        self.saved_weights += 1
         self.filewriter.add_scalar("Reward/avg", avg_reward, global_step=self.acting_step)
         self.acting_step += 1
 
@@ -411,7 +428,7 @@ class RLSystem:
                     predicted_value=predicted_value,
                     visit_counts=k_step_policies, 
                     predicted_policy=predicted_policy,
-                    target_transformation=self.mu_zero.rep_net._supports_representation,
+                    target_transformation=self.scalar_transforms.supports_representation,
                     K=self.K
                 )
 
@@ -587,16 +604,17 @@ class RLSystem:
             )
             obs_trajectories.append(observation_trajectory)
 
+        frames = [[] for _ in range(batch)]
         #perform search
         step_i = 0
         with torch.no_grad():
             while not torch.all(done == True):
-                if step_i > 200:
+                if step_i > self.max_steps_test:
                     break
                 #sample action
                 repnet_inputs = []
                 for i in range(batch):
-                    repnet_input = self._prepare_mcts_input(warp_state[i], obs_trajectories[i], self.real_resolution) #.unsqueeze(0)
+                    repnet_input = self._prepare_mcts_input(warp_state[i], obs_trajectories[i], self.real_resolution)
                     repnet_inputs.append(repnet_input)
                 hidden_state = self.mu_zero.create_hidden_state_root(torch.stack(repnet_inputs))
                 value, visit_counts = self.latent_mcts.search(hidden_state, valid_actions, self.training_iteration)
@@ -619,8 +637,15 @@ class RLSystem:
                 warp_state = self.convert_to_grayscale(state)
                 
                 #write the frame
-                frame = torch.cat((warp_state[0], warp_state[1]), dim=-1) # state[2]), dim=-1)
-                self.filewriter.add_image(f"TEST_{self.training_iteration}/frame", frame, global_step=step_i, dataformats="CHW")
+                for idx in range(batch):
+                    if not done[idx]:
+                        frames[idx].append(warp_state[idx])
+                        
+
+                # frame = torch.cat((warp_state[0], warp_state[1]), dim=-1) 
+                # self.filewriter.add_image(f"TEST_{self.training_iteration}/frame", frames, global_step=step_i, dataformats="CHW")
+                if step_i % 10 == 0:
+                    print(f"STEP: {step_i}")
                 step_i += 1
 
                 #save to observation trajectory
@@ -629,16 +654,31 @@ class RLSystem:
                         action[0].item(), warp_state[i], reward[i], visit_counts[i], value[i]
                     )
 
+        #find game with longest run
+        max_idx = 0
+        max_len = 0
+        for idx in range(batch):
+            if len(frames[idx]) > max_len:
+                max_len = len(frames[idx])
+                max_idx = idx
+
+        #write the max idx to tensorboard
+        for step, frame in enumerate(frames[max_idx]):
+            self.filewriter.add_image(f"TEST_{max_idx}/frame", frame, global_step=step, dataformats="CHW")
+
         #cleanup
         del obs_trajectories, state, hidden_state, repnet_input, value, visit_counts
 
         print("DONE")
 
-    def _save_weights(self, iteration):
+    def _save_weights(self, iteration, name=None):
         """
         Saves the model weights, optimizer state, and training iteration.
         """
-        save_path = self.checkpoint_path
+        if name:
+            save_path = f"weights/checkpt_inf_{name}.pth" 
+        else:
+            save_path = "weights/checkptX2.pth"
         torch.save({
             "model_state_dict": self.mu_zero.state_dict(),
             "optimizer_state_dict": self.mu_zero.optimizer.state_dict(),  # Save optimizer state
@@ -657,7 +697,7 @@ class RLSystem:
                 "max_length": self.replay_buffer.max_length,
                 "bootstrapped_values": self.replay_buffer.bootstrapped_values
             }
-        }, "weights/checkptX2.pth")
+        }, save_path)
         print(f"Model weights, optimizer state, replay buffer and training iteration {self.training_iteration} saved to {save_path}")
 
     def _load_weights(self):
@@ -708,41 +748,8 @@ if __name__ == "__main__":
     with open("config.yaml", "r") as file:
         config = yaml.safe_load(file)
     
-    #Args...
-    planes = 256
-    batch = 1 #currently gives the most speedup
-    repnet_input = torch.ones((batch, planes, 4, 4)).to("cuda")
-    
-    #inits
-    # muzero = MuZeroAgent(cfg=config["parameters"]["model"])
-    
-    # mcts_vec = MCTSSearchVec(cfg=config["parameters"], mu_zero=muzero)
-    # print("STARTING VEC SEARCH")
-    # start = time.time()
-    # value, visit_counts = mcts_vec.search(repnet_input.to("cuda"), action_mask=torch.ones(batch, 3))
-    # end = time.time()
-    # print("FINISHED VEC SEARCH")
-    # print(f"MCTS Vec time: {end - start}")
-
-    # # print(value[:10])
-    # # print(visit_counts[:10])
-    
-    # # search
-    # repnet_input = torch.ones((1, planes, 4, 4))
-    # mcts = MCTSSearch(cfg=config["parameters"], mu_zero=muzero)
-    # print("STARTING SEARCH")
-    # start = time.time()
-    # for sample in tqdm(range(batch)):
-    #     value, visit_counts = mcts.search(repnet_input.to("cuda"), action_mask=torch.tensor([0, 1, 1]).to(torch.float))
-    # end = time.time()
-    # print("FINISHED SEARCH")
-    # print(f"MCTS seq time: {end - start}")
-
     trainer = RLSystem(config["parameters"])
     trainer.train()
-
-    # mcts = TensorDictMCTSSearch(cfg=config["parameters"], mu_zero=muzero)
-    # value, visit_counts = mcts.search(repnet_input, action_mask=torch.ones(batch, 3))
 
 
     print("Done")

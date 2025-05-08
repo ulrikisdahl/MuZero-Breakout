@@ -35,87 +35,9 @@ class ResidualBlock(nn.Module):
         return self.act(x) 
 
 
-
-
-class BaseNetwork(nn.Module):
-    """
-    Base class for the networks and wrapper for nn.Module class
-    """
-    def __init__(self, cfg: dict):
-        super().__init__()
-        self.epsilon = 0.001
-        supports_min = cfg["supports_min"]
-        supports_max = cfg["supports_max"]
-        self.num_supports = cfg["num_supports"]
-        self.device = cfg["device"]
-        self.supports = torch.linspace(supports_min, supports_max, self.num_supports).to(self.device)
-
-    def _invertible_transform_normal_to_compact(self, x):
-        """ Maps the reward/value to a more compact representation to compress large values into the support representation range
-        Obtain categorical representations of the reward/value targets equivalent to the output representations of the networks """
-        return torch.sign(x) * (torch.sqrt(torch.abs(x) + 1) - 1 + self.epsilon * x)
-        
-    def _invertible_transform_compact_to_normal(self, x):
-        """ Maps the reward/value back to the original representation """
-        return torch.sign(x) * ((torch.abs(x) + (1-self.epsilon))**2 - 1)
-        
-    def _supports_representation(self, target_value):
-        """ Rewards and Values represented categorically with a possible range of [-300, 300]
-        Original value x is represented as x = p_low * x_low + p_high * x_high (page: 14)
-        1. Transform target scalar using invertible transformation to compress
-        2. Map it to the support set using a linear combination of two adjacent supports
-        3. Return a probability distribution over the supports
-        
-        Args:
-            target_value (batch_size, K): Observed rewards or values at each step k in the sample
-            
-        Return:
-            support_vector (batch_size, K, num_supports): A probability distribution over the supports
-        """
-        # Transform to compact representation
-        target_transformed = self._invertible_transform_normal_to_compact(target_value)
-        
-        # Find the closest support indices
-        lower_idx = torch.searchsorted(self.supports, target_transformed, right=True) - 1
-        lower_idx = lower_idx.clamp(0, self.num_supports - 2)  # Fix 3: Ensure upper_idx doesn't go out of bounds
-        upper_idx = lower_idx + 1
-        
-        # Get the supports
-        lower_support = self.supports[lower_idx]
-        upper_support = self.supports[upper_idx]
-        
-        # Compute linear combination coefficients
-        p_low = (upper_support - target_transformed) / (upper_support - lower_support + 1e-10)
-        p_high = 1 - p_low
-        
-        batch_size, k = target_value.shape
-        support_vector = torch.zeros((batch_size, k, self.num_supports)).to(self.device)
-        support_vector.scatter_(2, lower_idx.unsqueeze(-1), p_low.unsqueeze(-1))
-        support_vector.scatter_(2, upper_idx.unsqueeze(-1), p_high.unsqueeze(-1))
-        
-        return support_vector
-    
-    def _softmax_expectation(self, softmax_distribution):
-        """
-        Computes the expectation of a softmax distribution over the supports
-
-        Used for inference
-        """
-        return torch.sum(softmax_distribution * self.supports, dim=-1)
-
-    def inverted_softmax_expectation(self, softmax_distribution):
-        """
-        First computes the expected value under the respective "softmax" distribution and subsequently inverts the scaling transformation
-        """
-        softmax_distribution = F.softmax(softmax_distribution, dim=-1)
-        softmax_expectation = self._softmax_expectation(softmax_distribution)
-        inverted_transform = self._invertible_transform_compact_to_normal(softmax_expectation)
-        return inverted_transform
-
-
-class RepresentationNetwork(BaseNetwork):
+class RepresentationNetwork(nn.Module):
     def __init__(self, cfg, in_ch: int):
-        super().__init__(cfg)
+        super().__init__()
         latent_ch = cfg["latent_channels"]
         activation = cfg["representation_network"]["activation"]
         num_res_blocks = cfg["representation_network"]["num_res_blocks"] #list specifying how many res-blocks should be in each sequence of res-blocks
@@ -180,7 +102,7 @@ class RepresentationNetwork(BaseNetwork):
 
 
 
-class DynamicsNetwork(BaseNetwork):
+class DynamicsNetwork(nn.Module):
     """
     Input/Output: Hidden state + Action -> Hidden state + reward
 
@@ -188,12 +110,11 @@ class DynamicsNetwork(BaseNetwork):
         - Each conv has 256 filters
     """
     def __init__(self, cfg: dict, in_ch: int, latent_resolution: int):
-        super().__init__(cfg)
+        super().__init__()
         self.num_res_blocks = cfg["dynamics_network"]["num_res_blocks"]
         activation = cfg["dynamics_network"]["activation"]
         num_supports = cfg["num_supports"] #601 supports in range [-300, 300] 
         num_actions = cfg["dynamics_network"]["num_actions"]
-        # latent_resolution = (1,1) #TODO
 
         self.conv_block = ConvBlock(
             activation=activation,
@@ -211,7 +132,6 @@ class DynamicsNetwork(BaseNetwork):
                 )
             )
 
-        #generates next hidden state
         self.state_head = nn.Sequential(
             #nothing - the state should be the same shape as input
         )
@@ -227,14 +147,7 @@ class DynamicsNetwork(BaseNetwork):
                 padding=0
             ),
             nn.Flatten(start_dim=1, end_dim=-1),
-
-            #AlphaZero version
-            # nn.Linear(in_features=in_ch*latent_resolution[0]*latent_resolution[1], out_features=1)
-            # nn.Tanh()
-
-            #MuZero version - n_supports logits
             nn.Linear(in_features=in_ch*latent_resolution[0]*latent_resolution[1], out_features=num_supports)
-            # nn.Softmax(dim=1)
         )
 
     def forward(self, hidden_state):
@@ -256,7 +169,7 @@ class DynamicsNetwork(BaseNetwork):
         return hidden_state, reward
 
 
-class PredictionNetwork(BaseNetwork): 
+class PredictionNetwork(nn.Module):
     """
     Input/Output: Hidde state -> Policy dist, value est
 
@@ -270,7 +183,7 @@ class PredictionNetwork(BaseNetwork):
         Value: Estimate softmax supports distribution -> invert to scalar format using invertible transformation (page: 14)
     """
     def __init__(self, cfg: dict, in_ch: int, latent_resolution: tuple):
-        super().__init__(cfg)
+        super().__init__()
         self.num_res_blocks = cfg["prediction_network"]["num_res_blocks"]
         num_actions = cfg["prediction_network"]["num_actions"] #0: left, 1:stay, 2:right for breakout
         activation = cfg["prediction_network"]["activation"]
@@ -308,15 +221,7 @@ class PredictionNetwork(BaseNetwork):
                 padding=0
             ),
             nn.Flatten(start_dim=1, end_dim=-1),
-            #NOTE: Accodring to AlphaGo Zero paper there should be another fully-connected layer here
-            
-            #AlphaZero version
-            # nn.Linear(in_features=(in_ch//2) * latent_resolution[0] * latent_resolution[1], out_features=1)
-            # nn.Tanh()
-
-            #MuZero version - n_supports logits
             nn.Linear(in_features=(in_ch//2) * latent_resolution[0] * latent_resolution[1], out_features=num_supports) #output raw logits
-            # nn.Softmax(dim=1) #gives us the probability distribution over the support representation
         ) 
 
     def forward(self, hidden_state: torch.tensor):
