@@ -1,193 +1,271 @@
 from src.networks import MuZeroAgent
 import torch
 import math
+from tqdm import tqdm
+import networkx as nx
+import matplotlib.pyplot as plt
+import torch.nn.functional as F
+from utils import ScalarTransforms
 
-#NOTE Does this take a lot more resources than just a dict?
-class TreeStruct:
-    def __init__(self, parent):
-        self.parent = None
-        self.children = {}
-        self.value = None
-        self.state = None
+class MCTSSearchVec:
 
-
-class MCTSSearch:
-    def __init__(self, cfg, mu_zero: MuZeroAgent): 
+    def __init__(self, cfg, mu_zero: MuZeroAgent, scalar_transforms: ScalarTransforms):
         self.num_simulations = cfg["num_simulations"]
         self.actions = cfg["actions"]
         self.c1 = cfg["search"]["c1"]
         self.c2 = cfg["search"]["c2"]
         self.discount = cfg["search"]["discount_factor"]
         self.mu_zero = mu_zero
+        self.scalar_transforms = scalar_transforms
         self.latent_resolution = cfg["latent_resolution"]
+        self.dirchlet_alpha = 0.25
+        self.noise_weight = 0.175
 
-    def search(self, hidden_state: torch.tensor, action_mask: torch.tensor): #TODO: use vmap here in JAX
+    def search(self, hidden_state: torch.tensor, action_mask: torch.tensor, training_iteration: int):
         """
         Performs a latent MCTS search and returns the visit count statistics from the root node
-        
+        Parallel: Traverses each sample's MCTS tree sequentially each simulation-iteration, but builds up a "buffer"
+                  of expanded states in order to call the networks in parallel on GPU
+
         Args:
-            hidden_state (batch_size=1, planes, resolution[0], resolution[1]): root node of the hidden state search tree
-            action_mask (n_actions): 0 for illegal actions, 1 for legal actions
+            hidden_state (parallel, planes, resolution[0], resolution[1]): root node of the hidden state search tree
+            action_mask (parallel, n_actions): 0 for illegal actions, 1 for legal actions
+            training_iteration: which iteration we are on
         
-        tree: {
-            state_0: {  
-                0: { "N": 10, "Q": 0.5, "P": 0.2, "R": 1.0, "next_state": state_1 }, 
-                1: { "N": 5, "Q": -0.2, "P": 0.3, "R": -1.0, "next_state": state_2 },
-                ... ,
-                "state": tensor,
-                "value": int,
-                "expanded": bool
-            },
-            state_0_1 {...}
-        }
+        Returns:
+            value (batch_size): The estimated value from the root node
+            visit_counts (batch_size, 3): How many times each action was chosen from the root node
         """
-        #Init root
-        tree = {
-            "state_0": {
-                0: {"N": 0, "Q": 0},
-                1: {"N": 0, "Q": 0},
-                2: {"N": 0, "Q": 0}, 
-                "state": hidden_state,
-                "value": None,
-                "expanded": False
-            }
-        }
-        current_node = "state_0"
-        prev_node = current_node
-        subtree = tree[current_node]
-        batch_size = hidden_state.shape[0] 
-        action = torch.multinomial(action_mask, num_samples=batch_size, replacement=True).item() #samples indecies of that have 1s in the mask
+        batch_size = hidden_state.shape[0]
         
-        #prediction for root state
-        policy_dist, value = self.mu_zero.evaluate_state(hidden_state) #TODO: move to device ("cuda")
-        policy_dist, value = torch.softmax(policy_dist.squeeze(0), dim=0), value.squeeze(0) #remove batch dim
-        tree[current_node]["value"] = value
-
-        #apply probability mask
-        for action_i in self.actions:
-            child_node = f"state_{0}_{action_i}"
-            tree[current_node][action_i]["P"] = policy_dist[action_i] * action_mask[action_i] #action_mask[action] is zero if the action is not allowed
-            tree[current_node][action_i]["next_state"] = child_node #NOTE: this is a dummy state that will be expanded later
-            tree[child_node] = {"expanded": False}
-
-        #s0 is now expaned (expect for the expanded field in its subtree dict -- soon...)
-
-        #MCTS
+        #initialize trees and root nodes
+        trees = self._initialize_trees(batch_size, hidden_state)
+        
+        #expand root nodes
+        trees, expand_buffer, last_nodes, actions, trajectories = self._expand_root_nodes(
+            trees, hidden_state, action_mask, batch_size
+        )
+        
+        #perform MCTS simulations
         for simulation in range(self.num_simulations):
+            if simulation > 0:
+                #select nodes to expand
+                trajectories, expand_buffer, last_nodes = self._select_nodes(
+                    trees, batch_size, action_mask
+                )
+            
+            #expand selected nodes and get updated states
+            expanded_node_states, rewards, policy_dists, values = self._expand_nodes(
+                expand_buffer, last_nodes
+            )
+            
+            #update statistics and backup values
+            self._backup(
+                trees, last_nodes, trajectories, expanded_node_states, 
+                rewards, values, policy_dists, simulation, batch_size
+            )
+        
+        #compute final results
+        values, visit_counts_batched = self._compute_results(trees, batch_size)
+        
+        return torch.tensor(values), torch.stack(visit_counts_batched)
+    
+    def _initialize_trees(self, batch_size, hidden_state):
+        """Initialize the MCTS trees for each batch sample"""
+        trees = [
+            {
+                "state_0": {
+                    0: {"N": 0, "Q": 0},
+                    1: {"N": 0, "Q": 0},
+                    2: {"N": 0, "Q": 0},
+                    3: {"N": 0, "Q": 0},
+                    "state": hidden_state[sample],
+                    "value": None,
+                    "expanded": False
+                }
+            }
+            for sample in range(batch_size)
+        ]
+        return trees
+    
+    def _expand_root_nodes(self, trees, hidden_state, action_mask, batch_size):
+        """Predict and expand the root nodes of the search trees"""
+        # Prediction for root state
+        with torch.no_grad():
+            policy_dist, value = self.mu_zero.evaluate_state(hidden_state)
+            
+        value = self.scalar_transforms.inverted_softmax_expectation(value).to("cpu")
+        policy_dist = policy_dist.to("cpu")
+        policy_dist_valid = policy_dist.clone()
+        policy_dist_valid = torch.softmax(policy_dist_valid, dim=1)
+        
+        #apply probability mask and select initial action
+        actions = []
+        trajectories = []
+        expand_buffer = []
+        last_nodes = []
+        
+        for idx, tree in enumerate(trees):
+            current_node = "state_0"
+            tree[current_node]["value"] = value[idx]
+            tree[current_node]["expanded"] = True
+            
+            #dirichlet noise
+            noise = torch.distributions.Dirichlet(torch.ones(len(self.actions)) * self.dirchlet_alpha).sample()
+            
+            #set up statistics for children
+            for action_i in self.actions:
+                child_node = f"state_{0}_{action_i}"
+                tree[current_node][action_i]["P"] = (1-self.noise_weight) * policy_dist_valid[idx][action_i] + self.noise_weight * noise[action_i]
+                tree[current_node][action_i]["next_state"] = child_node
+                tree[child_node] = {"expanded": False}
+                
+            trees[idx] = tree
+            action_i = self.ucb_action(tree[current_node], torch.ones_like(action_mask), idx)
+            actions.append(action_i)
+            
+            #use initial action
+            prev_node = current_node
+            current_node = tree[current_node][action_i]["next_state"]
+            expand_buffer.append(hidden_state[idx])
+            last_nodes.append((prev_node, action_i, current_node))
+            trajectories.append([])
+            
+        return trees, expand_buffer, last_nodes, actions, trajectories
+    
+    def _select_nodes(self, trees, batch_size, action_mask):
+        """
+        Traverses the tree from each sample using UCB for selection until un-expanded node is reached
+
+        Returns:
+            trajectories: 
+            expand_buffer: 
+            last_nodes:
+        """
+        trajectories = []
+        expand_buffer = []
+        last_nodes = []
+        
+        for sample in range(batch_size):
             trajectory = []
             current_node = "state_0"
-            subtree = tree[current_node]
+            prev_node = current_node
+            subtree = trees[sample][current_node]
             
-            #traverse the tree
+            level = 0
             while True:
-                if not subtree["expanded"]: #time to expand   
-                    tree[current_node]["expanded"] = True
-                    current_node = subtree[action]["next_state"]
-                    tree[current_node] = { # expand the new node, but it is not fully expanded yet
-                        0: {"N": 0},
-                        1: {"N": 0},
-                        2: {"N": 0}, 
-                        "state": None,
-                        "value": None,
-                        "expanded": False
-                    }
-                    break
-
-                #SELECT() 
-                visit_sum = sum([subtree[act]["N"] for act in self.actions])
-                log_term = (visit_sum + self.c2 + 1) / self.c2
-                ucb = torch.tensor([])
-                for action in self.actions:
-                    ucb_i = subtree[action]["Q"] + subtree[action]["P"] * math.sqrt(visit_sum) / (1 + subtree[action]["N"]) * (self.c1 + math.log(log_term))
-                    ucb = torch.cat((ucb, torch.tensor([ucb_i])), dim=0)
-                action = torch.argmax(ucb, dim=0).item() #select a_k
+                action_i = self.ucb_action(subtree, torch.ones_like(action_mask), sample)
                 
                 prev_node = current_node
-                current_node = subtree[action]["next_state"]
-                subtree = tree[current_node]                     #NOTE: at the final step the node action points to does not yet have a real state
+                current_node = subtree[action_i]["next_state"]
+                subtree = trees[sample][current_node]
                 
+                level += 1
                 if subtree["expanded"]:
-                    trajectory.append((prev_node, action, tree[prev_node][action]["R"]))
-                    # --> Need to save prev_node because when we use the reward it is for the edge (s, a) going INTO current_node
+                    trajectory.append((prev_node, action_i, trees[sample][prev_node][action_i]["R"]))
                 else:
-                    tree[current_node] = { # expand the new node, but it is not fully expanded yet
+                    trees[sample][current_node] = {
                         0: {"N": 0},
                         1: {"N": 0},
-                        2: {"N": 0}, 
+                        2: {"N": 0},
+                        3: {"N": 0},
                         "state": None,
                         "value": None,
-                        "expanded": True #we will expand this node now
+                        "expanded": True 
                     }
+                    expand_buffer.append(trees[sample][prev_node]["state"])
+                    last_nodes.append((prev_node, action_i, current_node))
                     break
-
-            #EXPAND() - create state for the expand(node) and stats for children    
-            action_encoded = self._encode_action(action, self.latent_resolution, n_actions=3)
-            expanded_node_state, reward = self.mu_zero.hidden_state_transition(tree[prev_node]["state"].to("cuda"), action_encoded.to("cuda"))
-            reward = self.mu_zero.dyn_net.softmax_expectation(reward) #TODO: very unclean
-            tree[current_node]["state"] = expanded_node_state
-            tree[prev_node][action]["R"] = reward
-
-            trajectory.append((prev_node, action, reward))
-
-            policy_dist, value = self.mu_zero.evaluate_state(expanded_node_state.to("cuda")) #wrong to evaluate on expanded state
-            policy_dist = torch.softmax(policy_dist.squeeze(0), dim=0)
-            value = self.mu_zero.dyn_net.softmax_expectation(value) #TODO
-            tree[current_node]["value"] = value 
-            for action in self.actions:
-                next_state = f"state_{simulation + 1}_{action}" 
-                tree[current_node][action] = {"N": 0, "Q": 0, "P": policy_dist[action], "R": 0.0, "next_state": next_state}
-                tree[next_state] = {"expanded": False}
-
-            #BACKUP() - node-l = expanded node (current_node)
-            for k, (node, action, r) in enumerate(trajectory):
-                bootstrapped_reward = self._bootstrap_reward(trajectory, k, len(trajectory) + 1, value) 
-                tree[node][action]["N"] += 1
-                tree[node][action]["Q"] = (tree[node][action]["N"] * tree[node][action]["Q"] + bootstrapped_reward) / (tree[node][action]["N"] + 1)
-
-        visit_counts = [tree["state_0"][action]["N"] for action in self.actions]
-        
-        #compute estimated value  ---  NOTE not so sure about this one
-        value = 0.0 
-        for action in self.actions:
-            value += tree["state_0"][action]["N"] * tree["state_0"][action]["Q"]
-        value /= sum(visit_counts)
-
-        del tree, trajectory #NOTE: Dont need to keep the tree
-
-        return value, torch.tensor(visit_counts)
-        
-
-    def _encode_action(self, action: int, resolution: tuple, n_actions: int): #TODO: Move to utils
+                    
+            trajectories.append(trajectory)
+            
+        return trajectories, expand_buffer, last_nodes
+    
+    def _expand_nodes(self, expand_buffer, last_nodes):
         """
+        Computes state tensor and transition reward for all expanded nodes in parallel
+        Computes estimated value and policy distribution for all expanded nodes in parallel
+        """
+        actions_precoded = torch.tensor([action for _, action, _ in last_nodes])
+        action_encoded = self._encode_action(actions_precoded, self.latent_resolution, n_actions=len(self.actions)).to("cuda")
+        expand_buffer = torch.stack(expand_buffer)
+        
+        with torch.no_grad():
+            expanded_node_states, rewards = self.mu_zero.hidden_state_transition(expand_buffer, action_encoded)
+            policy_dists, values = self.mu_zero.evaluate_state(expanded_node_states)
+            
+        rewards = self.scalar_transforms.inverted_softmax_expectation(rewards)
+        values = self.scalar_transforms.inverted_softmax_expectation(values)
+        policy_dists = torch.softmax(policy_dists.to("cpu"), dim=1)
+        
+        return expanded_node_states, rewards, policy_dists, values
+    
+    def _backup(self, trees, last_nodes, trajectories, expanded_node_states, rewards, values, policy_dists, simulation, batch_size):
+        """
+        Update node statistics and backup values through the tree
+        """
+        for sample in range(batch_size):
+            prev_node = last_nodes[sample][0]
+            action = last_nodes[sample][1]
+            current_node = last_nodes[sample][2]
+            value = values[sample]
+            
+            #update expanded node
+            trees[sample][current_node]["state"] = expanded_node_states[sample]
+            trees[sample][prev_node][action]["R"] = rewards[sample]
+            trees[sample][current_node]["value"] = value
+            
+            #create edges for potential next states from expanded node
+            for action_i in self.actions:
+                next_state = f"state_{simulation + 1}_{action_i}"
+                trees[sample][current_node][action_i] = {
+                    "N": 0, "Q": 0, "P": policy_dists[sample][action_i], 
+                    "R": 0.0, "next_state": next_state
+                }
+                trees[sample][next_state] = {"expanded": False}
+                
+            trajectories[sample].append((prev_node, action, rewards[sample]))
+            
+            #Backup values through the trajectory
+            for k, (node, action_i, r) in reversed(list(enumerate(trajectories[sample]))):
+                value = value * self.discount + r
+                trees[sample][node]["value"] += value.to("cpu")
+                trees[sample][node][action_i]["Q"] = (trees[sample][node][action_i]["N"] * trees[sample][node][action_i]["Q"] + value) / (trees[sample][node][action_i]["N"] + 1)
+                trees[sample][node][action_i]["N"] += 1
+    
+    def _compute_results(self, trees, batch_size):
+        """
+        Compute the estimated value for the root node along with visit counts statistics
+        """
+        values = []
+        visit_counts_batched = []
+        
+        for sample in range(batch_size):
+            visit_counts = [trees[sample]["state_0"][action]["N"] for action in self.actions]
+            visit_counts_batched.append(torch.tensor(visit_counts))
+            values.append(
+                trees[sample]["state_0"]["value"].item() / self.num_simulations
+            )
+            
+        return values, visit_counts_batched
+    
+    def _encode_action(self, action: torch.Tensor, resolution: tuple, n_actions: int):
+        """
+        Encodes a batch of actions into a tensor with n_actions planes, as per MuZero. Same as used _encode_action_dynamics
+
         Args:
-            action (int): chosen action we want to encode
+            action (torch.Tensor): Tensor of shape (batch,) containing chosen actions (integers).
+            resolution (tuple): (height, width) of the output encoding.
+            n_actions (int): Total number of possible actions.
 
-        Returns: 
-            action_encoded (1, 1, res[0], res[1]): encoded version of the action scaled by 1/n_actions
+        Returns:
+            action_encoded (batch, n_actions, resolution[0], resolution[1]): One-hot encoded action planes.
         """
-        action = torch.tensor([action])[None, None, None, :] #unsqueeze tensor
-        action_encoded = action.expand(-1, -1, resolution[0], resolution[1]) * (1/n_actions)
+        batch_size = action.shape[0]
+        action_encoded = torch.zeros(batch_size, n_actions, resolution[0], resolution[1], device=action.device)
+        action_one_hot = F.one_hot(action, num_classes=n_actions).float()
+        action_encoded = action_one_hot.view(batch_size, n_actions, 1, 1).expand(-1, -1, resolution[0], resolution[1]) #tile across spatial dimension
         return action_encoded
-
-    def _selection(self, sub_tree: dict):
-        """
-        UCB selection 
-        """
-        return
-    
-    def _expansion(self):
-        """
-        Create the hidden child nodes and statistics to their incoming edges (from expanded node) 
-        """
-        
-        return
-    
-    def _backup(self):
-        """
-        Update the statistics along the simulation trajectory (tree path)
-        """
-
-        return
 
     def _bootstrap_reward(self, trajectory: list, k: int, depth: int, value_l: float):
         """
@@ -196,24 +274,25 @@ class MCTSSearch:
         """
         cumulative_discounted_reward = 0.0
         for tau in range(depth - 1 - k):
-            """
-            We use reward from traj[k+tau] instead of traj[k+1+tau] because remember in SELECTION: R(s_l-1, a_l) = r_l  
-            """
-            cumulative_discounted_reward += (self.discount ** tau) * trajectory[k + tau][-1] + (self.discount ** (depth - k)) * value_l
+            cumulative_discounted_reward += (self.discount ** tau) * trajectory[k + tau][-1] 
+        cumulative_discounted_reward += (self.discount ** (depth - k - 1)) * value_l
         return cumulative_discounted_reward
 
-    def k_step_rollout(self):
+    def ucb_action(self, subtree, action_mask, idx):
         """
+        Selects the action given the ucb formula
         """
-        #Maybe this does not belong to the MCTSSearch class
-
-        return
-    
-
-
-"""
-IMPROVEMENTS:
-    - for scalar values we change between representing them as primitives and as torch tensors - consistency is needed
-
-CONSIDERATIONS:
-"""
+        visit_sum = sum([subtree[act]["N"] for act in self.actions])
+        log_term = (visit_sum + self.c2 + 1) / self.c2
+        ucb = []
+        for action_i in self.actions:
+            ucb_i = subtree[action_i]["Q"] + subtree[action_i]["P"] * math.sqrt(visit_sum) / (1 + subtree[action_i]["N"]) * (self.c1 + math.log(log_term))
+            if not action_mask[idx][action_i]: #action is illegal from root state
+                ucb_i = -math.inf
+            ucb.append(ucb_i)
+        ucb = torch.tensor(ucb)
+        max_val = ucb.max().item()
+        
+        best_indices = (ucb == max_val).nonzero(as_tuple=True)[0]
+        selected_index = best_indices[torch.randint(len(best_indices), (1,))].item() #introduce some randomness if there are ties
+        return selected_index

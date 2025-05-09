@@ -4,13 +4,13 @@ from dataclasses import dataclass
 @dataclass
 class ObservationTrajectory:
     """
-    Idea behind this class is to store each type of data more compactly such that retrieval is easier (avoids iteration)
+    Stores observation trajectories 
     """
-    actions: list[int] #TODO: init list?
+    actions: list[int] 
     states: list[torch.tensor]
     rewards: list[float]
     visit_counts: list[torch.tensor]
-    values: list[float] #NOTE: might be torch tensors
+    values: list[float] 
     length: int #only includes the real states of the trajectory (not zero paddings)
     reward_sum: int
 
