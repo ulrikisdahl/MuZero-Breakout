@@ -5,16 +5,18 @@ from tqdm import tqdm
 import networkx as nx
 import matplotlib.pyplot as plt
 import torch.nn.functional as F
+from utils import ScalarTransforms
 
 class MCTSSearchVec:
 
-    def __init__(self, cfg, mu_zero: MuZeroAgent):
+    def __init__(self, cfg, mu_zero: MuZeroAgent, scalar_transforms: ScalarTransforms):
         self.num_simulations = cfg["num_simulations"]
         self.actions = cfg["actions"]
         self.c1 = cfg["search"]["c1"]
         self.c2 = cfg["search"]["c2"]
         self.discount = cfg["search"]["discount_factor"]
         self.mu_zero = mu_zero
+        self.scalar_transforms = scalar_transforms
         self.latent_resolution = cfg["latent_resolution"]
         self.dirchlet_alpha = 0.25
         self.noise_weight = 0.175
@@ -93,7 +95,7 @@ class MCTSSearchVec:
         with torch.no_grad():
             policy_dist, value = self.mu_zero.evaluate_state(hidden_state)
             
-        value = self.mu_zero.rep_net.inverted_softmax_expectation(value).to("cpu")
+        value = self.scalar_transforms.inverted_softmax_expectation(value).to("cpu")
         policy_dist = policy_dist.to("cpu")
         policy_dist_valid = policy_dist.clone()
         # policy_dist_valid[action_mask==0] = float("-inf") #NOTE: Remove for now...
@@ -194,8 +196,8 @@ class MCTSSearchVec:
             expanded_node_states, rewards = self.mu_zero.hidden_state_transition(expand_buffer, action_encoded)
             policy_dists, values = self.mu_zero.evaluate_state(expanded_node_states)
             
-        rewards = self.mu_zero.rep_net.inverted_softmax_expectation(rewards)
-        values = self.mu_zero.rep_net.inverted_softmax_expectation(values)
+        rewards = self.scalar_transforms.inverted_softmax_expectation(rewards)
+        values = self.scalar_transforms.inverted_softmax_expectation(values)
         policy_dists = torch.softmax(policy_dists.to("cpu"), dim=1)
         
         return expanded_node_states, rewards, policy_dists, values

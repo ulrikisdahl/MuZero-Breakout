@@ -1,7 +1,8 @@
 import torch
 import torch.nn as nn
 import yaml
-from utils import get_class, ReplayBuffer, ObservationTrajectory, ScalarTransforms
+from utils import get_class, ScalarTransforms
+from replay_buffer import ReplayBuffer, ObservationTrajectory
 from tqdm import tqdm
 from statistics import mean
 import random
@@ -10,10 +11,6 @@ from torch.utils.tensorboard import SummaryWriter
 import os
 import torch.nn.functional as F
 import numpy as np
-
-reward_loss_fn = nn.NLLLoss() #used instead of CrossentropyLoss because the model outputs softmax probs
-value_loss_fn = nn.NLLLoss # nn.NLLLoss(log(softmax(logits)), ...) == nn.CrossEntropyLoss(logits, ...)
-ce_loss_fn = nn.CrossEntropyLoss()
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -49,21 +46,19 @@ def loss_fn(
         predicted_value: predicted distributions over supports
         target_transformation: transforms the target scalar to a supports representations and extracts the coefficient vector for the supports
     """
-    reward_loss = F.kl_div( #TODO: check these mid training (see how much we have weighted the different terms now)
+    reward_loss = F.kl_div( 
         F.log_softmax(predicted_reward.view(-1, predicted_reward.shape[-1]), dim=-1), 
-        # F.softmax(target_transformation(observed_reward).view(-1, predicted_reward.shape[-1]), dim=-1),
         target_transformation(observed_reward).view(-1, predicted_reward.shape[-1]),
         reduction="batchmean"
     )
     value_loss = F.kl_div(
         F.log_softmax(predicted_value.view(-1, predicted_value.shape[-1]), dim=-1), 
-        # F.softmax(target_transformation(bootstrapped_reward).view(-1, predicted_value.shape[-1]), dim=-1),
         target_transformation(bootstrapped_reward).view(-1, predicted_value.shape[-1]),
         reduction="batchmean"
     )
 
     visit_counts_normalized = visit_counts / visit_counts.sum(dim=-1, keepdim=True)
-    policy_loss = F.kl_div( #NOTE: Used to be nn.CrossentropyLoss (policy_loss_fn)
+    policy_loss = F.kl_div(
         F.log_softmax(predicted_policy.view(-1, predicted_policy.shape[-1]), dim=-1),
         visit_counts_normalized.view(-1, visit_counts_normalized.shape[-1]),
         reduction="batchmean"
@@ -135,25 +130,17 @@ class RLSystem:
 
     def train(self):
         """
+        The training loop iteratively exchanges between acting stage and training stage
         """
         started_training = False
         for iteration in range(self.init_iteration, 50000):
-            """
-            
-            """
             if self.training_iteration > 10:
                 #start temperature decay
                 self.temperature *= 0.996
                 self.temperature = max(self.temperature, 0.1)
                 
-            if self.training_iteration == 100: 
-                self.latent_mcts.noise_weight = 0.14
-
-            if self.training_iteration == 200:
+            if self.training_iteration == 100:
                 self.latent_mcts.noise_weight = 0.1
-
-            if self.training_iteration == 300:
-                self.latent_mcts.noise_weight = 0.0
 
             if iteration % 15 == 0 and iteration != 0 and started_training:
                 self.load_latest_weights() #update Target Network
@@ -170,9 +157,9 @@ class RLSystem:
                 self.training_iteration += 1
                 started_training = True
 
-            if iteration % 15 == 0 and self.replay_buffer.length > self.samples_before_train: #TODO: This is way too rare! (we reached STEPS=2115)
-                print("SAVED WEIGHTS!")
+            if iteration % 15 == 0 and self.replay_buffer.length > self.samples_before_train:
                 self._save_weights(iteration)
+                print("SAVED WEIGHTS!")
 
             print(f"REPLAY_BUFFER: {self.replay_buffer.length}, STEPS: {self.training_step}")
 
@@ -232,23 +219,24 @@ class RLSystem:
             length_counter += 1
             self.action_stats = torch.cat((self.action_stats, action), dim=0)
 
+        #episode statistics
         episode_lens = [obs.length for obs in self.observation_trajectories]
         max_len = max(episode_lens)
         avg_len = mean(episode_lens) 
         value_counts = torch.bincount(self.action_stats.long(), minlength=self.n_actions)
         print(f"Max episode length: {max_len}, Average episode length: {avg_len}")
         print(f"Value counts 0: {value_counts[0]}, 1: {value_counts[1]}, 2: {value_counts[2]}")
+
+        #save to replay buffer
         for observation_trajectory in self.observation_trajectories:
             if observation_trajectory.length > (self.K + 1):
                 self.replay_buffer.save_observation_trajectory(observation_trajectory)
 
         del self.action_stats
-        self.action_stats = torch.tensor([]) #empty
+        self.action_stats = torch.tensor([])
         
         rewards = self.replay_buffer.get_reward_sums()
         avg_reward = mean(rewards)
-        if avg_reward > 9:
-            self._save_weights(0, self.saved_weights)
         self.saved_weights += 1
         self.filewriter.add_scalar("Reward/avg", avg_reward, global_step=self.acting_step)
         self.acting_step += 1
@@ -305,8 +293,11 @@ class RLSystem:
             actions (bs, actions): the actions we want to encode (create bias plane)
             n_actions (1,): the number of actions we want to create bias plane encoding for 
             resolution (2): tuple of resolution for the bias plane
+
+        Returns:
+            bias_plane (bs, n_actions, resolution[0], resolution[1])
         """
-        actions_expanded = (actions / self.n_actions)[:, :, None, None].expand(-1, -1, resolution[0], resolution[1]) #NOTE
+        actions_expanded = (actions / self.n_actions)[:, :, None, None].expand(-1, -1, resolution[0], resolution[1]) 
         bias_plane = torch.ones((actions.shape[0], n_actions, resolution[0], resolution[1]), device=actions_expanded.device) *  actions_expanded
         return bias_plane
     
@@ -323,25 +314,24 @@ class RLSystem:
             action_encoded (batch, n_actions, resolution[0], resolution[1]): One-hot encoded action planes.
         """
         batch_size = action.shape[0]
-        # Initialize tensor with zeros
         action_encoded = torch.zeros(batch_size, n_actions, resolution[0], resolution[1], device=action.device)
-        # Create one-hot encoding: (batch, n_actions)
         action_one_hot = F.one_hot(action, num_classes=n_actions).float()
-        # Tile across spatial dimensions
-        action_encoded = action_one_hot.view(batch_size, n_actions, 1, 1).expand(-1, -1, resolution[0], resolution[1])
+        action_encoded = action_one_hot.view(batch_size, n_actions, 1, 1).expand(-1, -1, resolution[0], resolution[1]) #tile across spatial dimensions
         return action_encoded
 
     def _pad_initial_state(self, initial_state):
         """
-        Sets the first 31 states in the trajectory to zero tensors
-        
-        self.state_history_length - 1: because the initial state is appended afterwards
+        Generates static observation trajectories for the self.state_history_length first states
+        'states' only has self.state_history_length-1 tensors because the last state is added as a result of a real transition
+
+        Args:
+            initial_state: The randomly initialized state that will be repeated (self.state_history_length-1) times
         """
         self.observation_trajectories = []
         for idx in range(self.n_parallel):    
             observation_trajectory = ObservationTrajectory(
                 actions=[0 for _ in range(self.state_history_length)],
-                states=[initial_state[idx] for _ in range(self.state_history_length - 1)],#[torch.zeros(3, self.real_resolution[0], self.real_resolution[1]) for _ in range(self.state_history_length - 1)], #one less because we will append initial_state from env
+                states=[initial_state[idx] for _ in range(self.state_history_length - 1)],
                 rewards=[0 for _ in range(self.state_history_length)],
                 visit_counts=[torch.zeros(self.n_actions) for _ in range(self.state_history_length)],
                 values=[0.0 for _ in range(self.state_history_length)],
@@ -387,89 +377,81 @@ class RLSystem:
 
     def _training_stage(self):
         """
-        Parallel
-
-        minibatch: set of observation trajectories
+        Training loop 
         """
         self.mu_zero.train_mode()
 
-        EPOCHS = 1 #concept of epochs is a social construct
-        for epoch in range(EPOCHS):
-            losses = []
-            # sampling_idxs = torch.randperm((int(self.replay_buffer.length)))[:int(num_training_samples)]
+        losses = []
 
-            sampling_idxs = torch.randperm(int(self.replay_buffer.length))
-            # for batch_start in tqdm(range(0, self.num_training_samples, self.minibatch_size)):
-            for batch_start in tqdm(range(0, self.num_batches * self.minibatch_size, self.minibatch_size)):
-                """
-                k_step_policies: observed visist-counts used to compare with policy_prediction at each step k in the k-step rollout
-                k_step_actions: selected actions from sample trajectory. Used for making hidden state transitions in the k-step rollout
-                k_step_rewards: observed rewards used to compare with predicted rewards from the k-step rollout
-                k_step_value: observed value from MCTS search used to compare with predicted value at each step k
-                """
-                self.mu_zero.optimizer.zero_grad()
+        sampling_idxs = torch.randperm(int(self.replay_buffer.length))
+        for batch_start in tqdm(range(0, self.num_batches * self.minibatch_size, self.minibatch_size)):
+            """
+            k_step_policies: observed visist-counts used to compare with policy_prediction at each step k in the k-step rollout
+            k_step_actions: selected actions from sample trajectory. Used for making hidden state transitions in the k-step rollout
+            k_step_rewards: observed rewards used to compare with predicted rewards from the k-step rollout
+            k_step_value: observed value from MCTS search used to compare with predicted value at each step k
+            """
+            self.mu_zero.optimizer.zero_grad()
 
-                #prepare data
-                with torch.no_grad():
-                    batch_end = batch_start + self.minibatch_size
-                    batch_idxs = sampling_idxs[batch_start:batch_end]
-                    mbs_input_actions, mbs_input_states, k_step_policies, k_step_actions, k_step_rewards, k_step_value = self._prepare_minibatch(batch_idxs, device)
-                    input_actions_encoded = self._encode_actions(mbs_input_actions, self.state_history_length, self.real_resolution) #(batch, history_len, 16, 16)
-                    # k_step_actions_encoded = self._encode_actions(k_step_actions, self.K, self.latent_resolution) #these actions are used in the hidden state space (=latent_resolution)
-                
-                #forward pass
-                predicted_reward, predicted_value, predicted_policy = self._k_step_rollout(mbs_input_states, input_actions_encoded, k_step_actions) #(batch, K, 601), ..., (batch, K, n_actions)
-                
-                #backward
-                (loss, reward_loss, value_loss, policy_loss) = loss_fn(
-                    observed_reward=k_step_rewards,
-                    predicted_reward=predicted_reward,
-                    bootstrapped_reward=k_step_value, #bootstrapped_rewards, 
-                    predicted_value=predicted_value,
-                    visit_counts=k_step_policies, 
-                    predicted_policy=predicted_policy,
-                    target_transformation=self.scalar_transforms.supports_representation,
-                    K=self.K
-                )
-
-                losses.append(loss.item())
-                loss.backward()
-                self.mu_zero.optimizer.step()
-                self.training_step += 1
-
-            # Compute metrics
-            avg_loss = mean(losses)
-            avg_reward = mean(self.replay_buffer.get_reward_sums())
-
-            # TensorBoard logging: Loss and Reward (PERSISTENT)
-            global_step = self.training_iteration * EPOCHS + epoch
-            self.filewriter.add_scalar("Loss/train", avg_loss, global_step=global_step) #global_step = self.training_iteration
-            self.filewriter.add_scalar("Loss/reward", reward_loss, global_step=global_step)
-            self.filewriter.add_scalar("Loss/value", value_loss, global_step=global_step)
-            self.filewriter.add_scalar("Loss/policy", policy_loss, global_step=global_step)
-            # self.filewriter.add_scalar("Reward/avg", avg_reward, global_step=global_step)
+            #prepare data from Replay Buffer
+            with torch.no_grad():
+                batch_end = batch_start + self.minibatch_size
+                batch_idxs = sampling_idxs[batch_start:batch_end]
+                mbs_input_actions, mbs_input_states, k_step_policies, k_step_actions, k_step_rewards, k_step_value = self._prepare_minibatch(batch_idxs, device)
+                input_actions_encoded = self._encode_actions(mbs_input_actions, self.state_history_length, self.real_resolution) #(batch, history_len, 16, 16)
             
-            if epoch == 0 and self.training_step == 0:
-                #mbs_input_states has shape (batch, 3*len_history, 16, 16)
-                state_seq_0 = mbs_input_states[0].reshape(self.state_history_length, 3, self.real_resolution[0], self.real_resolution[1]) * 255
-                state_seq_1 = mbs_input_states[1].reshape(self.state_history_length, 3, self.real_resolution[0], self.real_resolution[1]) * 255
-                state_seq_2 = mbs_input_states[2].reshape(self.state_history_length, 3, self.real_resolution[0], self.real_resolution[1]) * 255      
-                state_seq_3 = mbs_input_states[5].reshape(self.state_history_length, 3, self.real_resolution[0], self.real_resolution[1]) * 255      
-                state_seq_4 = mbs_input_states[6].reshape(self.state_history_length, 3, self.real_resolution[0], self.real_resolution[1]) * 255      
-                # self.filewriter.add_image(f"trajectory_{epoch}", state_sequence, dataformats="NCHW")
+            #forward pass
+            predicted_reward, predicted_value, predicted_policy = self._k_step_rollout(mbs_input_states, input_actions_encoded, k_step_actions) #(batch, K, 601), ..., (batch, K, n_actions)
+            
+            #backward
+            (loss, reward_loss, value_loss, policy_loss) = loss_fn(
+                observed_reward=k_step_rewards,
+                predicted_reward=predicted_reward,
+                bootstrapped_reward=k_step_value, #bootstrapped_rewards, 
+                predicted_value=predicted_value,
+                visit_counts=k_step_policies, 
+                predicted_policy=predicted_policy,
+                target_transformation=self.scalar_transforms.supports_representation,
+                K=self.K
+            )
 
-                for i in range(self.state_history_length):
-                    # Add each frame as a separate step in the same run
-                    image = torch.cat((state_seq_0[i], state_seq_1[i], state_seq_2[i], state_seq_3[i], state_seq_4[i]), dim=-1)
-                    self.filewriter.add_image(f"trajectory_{self.training_iteration}_{epoch}/frame", image, global_step=i, dataformats="CHW")
+            losses.append(loss.item())
+            loss.backward()
+            self.mu_zero.optimizer.step()
+            self.training_step += 1
 
-                action_sequence = mbs_input_actions[0]
-                action_log = "\n".join([f"Timestep {t}: Action {int(action_sequence[t])}" for t in range(self.state_history_length)])
-                self.filewriter.add_text("trajectory_actions_" + str(epoch), action_log)
+        # Compute metrics
+        avg_loss = mean(losses)
+        avg_reward = mean(self.replay_buffer.get_reward_sums())
 
-            print(f"Epoch {epoch} loss: {avg_loss}") # mean-reward: {avg_reward}")
+        # TensorBoard logging: Loss and Reward
+        global_step = self.training_iteration 
+        self.filewriter.add_scalar("Loss/train", avg_loss, global_step=global_step)
+        self.filewriter.add_scalar("Loss/reward", reward_loss, global_step=global_step)
+        self.filewriter.add_scalar("Loss/value", value_loss, global_step=global_step)
+        self.filewriter.add_scalar("Loss/policy", policy_loss, global_step=global_step)
+        
+        if self.training_step == 0:
+            """
+            Visualize the input state transitions for the training samples
+            """
+        
+            state_seq_0 = mbs_input_states[0].reshape(self.state_history_length, 3, self.real_resolution[0], self.real_resolution[1]) * 255
+            state_seq_1 = mbs_input_states[1].reshape(self.state_history_length, 3, self.real_resolution[0], self.real_resolution[1]) * 255
+            state_seq_2 = mbs_input_states[2].reshape(self.state_history_length, 3, self.real_resolution[0], self.real_resolution[1]) * 255      
+            state_seq_3 = mbs_input_states[5].reshape(self.state_history_length, 3, self.real_resolution[0], self.real_resolution[1]) * 255      
+            state_seq_4 = mbs_input_states[6].reshape(self.state_history_length, 3, self.real_resolution[0], self.real_resolution[1]) * 255      
 
-        # self.mu_zero.scheduler.step()
+            for i in range(self.state_history_length):
+                # Add each frame as a separate step in the same run
+                image = torch.cat((state_seq_0[i], state_seq_1[i], state_seq_2[i], state_seq_3[i], state_seq_4[i]), dim=-1)
+                self.filewriter.add_image(f"trajectory_{self.training_iteration}_{self.training_step}/frame", image, global_step=i, dataformats="CHW")
+
+            action_sequence = mbs_input_actions[0]
+            action_log = "\n".join([f"Timestep {t}: Action {int(action_sequence[t])}" for t in range(self.state_history_length)])
+            self.filewriter.add_text("trajectory_actions_" + str(self.training_step), action_log)
+        print(f"Epoch {self.training_step} loss: {avg_loss}") # mean-reward: {avg_reward}")
+
         
         #run test simulation with the new weights
         self.environment.batch = 2
@@ -478,7 +460,7 @@ class RLSystem:
         self.latent_mcts.mu_zero = self.mu_zero_target #reset to use target network
         self.environment.batch = self.n_parallel
 
-    def _prepare_minibatch(self, batch_idxs: torch.tensor, device: str): #TODO: no-grad???
+    def _prepare_minibatch(self, batch_idxs: torch.tensor, device: str):
         """ 
         Needs to:
             Sample (uniformly) a current state and the previous 32 states + actions
@@ -539,7 +521,6 @@ class RLSystem:
                 value: (bs, 601)
             """
             policy_distribution, value = self.mu_zero.evaluate_state(hidden_state)
-            # value = self.mu_zero.rep_net.inverted_softmax_expectation(value) #NOTE: We want the model logits for the CE loss
             policy_stack.append(policy_distribution)
             value_stack.append(value)
 
@@ -550,38 +531,17 @@ class RLSystem:
             """
             actions_encoded = self._encode_action_dynamics(k_step_actions[:, k], self.latent_resolution, self.n_actions)
             hidden_state, reward = self.mu_zero.hidden_state_transition(hidden_state, actions_encoded) #need proper action encoding here
-            # reward = self.mu_zero.rep_net.inverted_softmax_expectation(reward)
             reward_stack.append(reward)
 
         #save shit
         return torch.stack(reward_stack, dim=1), torch.stack(value_stack, dim=1), torch.stack(policy_stack, dim=1)
-
-    def _bootstrap_rewards(self, rewards: torch.tensor, values: torch.tensor):
-        """
-        bootstrapped reward ≈ the value from the state
-        n: number of steps into the future that is used to compute a bootstrapped target (distinct from k, but n = K for now)
-
-        Args:
-            rewards (batch_size, K):  
-            values (batch_size, K):  
-
-        Returns:
-            bootstrapped_rewards (batch_size, K):  
-        """
-        bs =  rewards.shape[0]
-        z_tk = torch.zeros((bs, self.K), device=rewards.device)
-        for k in range(self.K):
-            future_rewards = rewards[:, k:]
-            discounts = self.gamma ** torch.arange(len(future_rewards[0]), device=rewards.device)
-            discounted_rewards = (future_rewards * discounts).sum(dim=1)
-            bootstrap = (self.gamma ** (self.K - k)) * values[:, -1]
-            z_tk[:, k] = discounted_rewards + bootstrap
-        return z_tk
     
-
     def run_test_simulation(self, batch):
         """
         Runs a game with the new model weights, logging it to tensorboad
+
+        Args:
+            batch (int): number of simulations to run in parallel
         """
         self.mu_zero.eval_mode()
 
@@ -593,9 +553,8 @@ class RLSystem:
         done = torch.tensor([False for _ in range(batch)])
         for idx in range(batch):
             observation_trajectory = ObservationTrajectory(
-                # actions=[0 for _ in range(self.state_history_length)], 
                 actions=[1 for _ in range(self.state_history_length)],
-                states=[warp_state[idx] for _ in range(self.state_history_length - 1)],#[torch.zeros(3, self.real_resolution[0], self.real_resolution[1]) for _ in range(self.state_history_length - 1)], #one less because we will append initial_state from env
+                states=[warp_state[idx] for _ in range(self.state_history_length - 1)],
                 rewards=[0 for _ in range(self.state_history_length)],
                 visit_counts=[torch.zeros(self.n_actions) for _ in range(self.state_history_length)],
                 values=[0.0 for _ in range(self.state_history_length)],
@@ -604,8 +563,8 @@ class RLSystem:
             )
             obs_trajectories.append(observation_trajectory)
 
-        frames = [[] for _ in range(batch)]
         #perform search
+        frames = [[] for _ in range(batch)]
         step_i = 0
         with torch.no_grad():
             while not torch.all(done == True):
@@ -620,12 +579,9 @@ class RLSystem:
                 value, visit_counts = self.latent_mcts.search(hidden_state, valid_actions, self.training_iteration)
 
                 #temperature based sampling
-                # temperature = max(1.0 - (self.training_iteration * 0.005), 0.1)
-                temperature = 0.1 #0.5 #be a bit more greedy during testing
+                temperature = 0.1
                 visit_counts_temp = visit_counts ** (1/temperature)
                 probs = visit_counts_temp / visit_counts_temp.sum(dim=1, keepdim=True)
-                # probs = probs * valid_actions
-                # probs = probs / probs.sum(dim=1, keepdim=True) #redistribute probabilities
                 action = torch.zeros(probs.shape[0], dtype=torch.long)
 
                 for i in range(probs.shape[0]):
@@ -641,9 +597,6 @@ class RLSystem:
                     if not done[idx]:
                         frames[idx].append(warp_state[idx])
                         
-
-                # frame = torch.cat((warp_state[0], warp_state[1]), dim=-1) 
-                # self.filewriter.add_image(f"TEST_{self.training_iteration}/frame", frames, global_step=step_i, dataformats="CHW")
                 if step_i % 10 == 0:
                     print(f"STEP: {step_i}")
                 step_i += 1
@@ -654,17 +607,11 @@ class RLSystem:
                         action[0].item(), warp_state[i], reward[i], visit_counts[i], value[i]
                     )
 
-        #find game with longest run
-        max_idx = 0
-        max_len = 0
-        for idx in range(batch):
-            if len(frames[idx]) > max_len:
-                max_len = len(frames[idx])
-                max_idx = idx
-
         #write the max idx to tensorboard
-        for step, frame in enumerate(frames[max_idx]):
-            self.filewriter.add_image(f"TEST_{max_idx}/frame", frame, global_step=step, dataformats="CHW")
+        #NOTE: change to iterate over all frames if it is desired to view all test runs
+        sample = 0
+        for step, frame in enumerate(frames[sample]):
+            self.filewriter.add_image(f"TEST_{sample}/frame", frame, global_step=step, dataformats="CHW")
 
         #cleanup
         del obs_trajectories, state, hidden_state, repnet_input, value, visit_counts
@@ -729,20 +676,14 @@ class RLSystem:
             self.replay_buffer.max_length = replay_data["max_length"]
             self.replay_buffer.bootstrapped_values = replay_data["bootstrapped_values"]
 
-            self.training_iteration = checkpoint.get("training_iteration", 0)  # Restore training iteration
-            self.acting_step = checkpoint.get("acting_step", 0)  # Restore acting step
-            self.init_iteration = checkpoint.get("iteration", 0)  # Restore initial iteration
+            self.training_iteration = checkpoint.get("training_iteration", 0)  #restore training iteration
+            self.acting_step = checkpoint.get("acting_step", 0)  #restore acting step
+            self.init_iteration = checkpoint.get("iteration", 0)  #restore initial iteration
             print(f"Loaded model weights and training iteration {self.training_iteration} from {self.checkpoint_path}")
         else:
             print(f"No checkpoint found at {self.checkpoint_path}, training from scratch.")
     
 
-    
-from src.mcts import MCTSSearch
-from src.networks import MuZeroAgent
-from src.parallel_mcts import MCTSSearchVec
-import time
-from tqdm import tqdm
 if __name__ == "__main__":
     
     with open("config.yaml", "r") as file:
@@ -752,26 +693,3 @@ if __name__ == "__main__":
     trainer.train()
 
 
-    print("Done")
-
-
-
-
-"""
-Todo:
-- When we predict value/policy during MCTS search the outputs are softmax-distribution vectors 
-- Fix tensor.to(device) abuse
-
-Questions:
-- Do we no_grad the episode generation?
-- Do i need to move tensors to GPU for each iteration in the MCTS search -- device
-
-Check:
-- Normalization: Are the state inputs always in range [0, 1]
-- BOTH hidden states and action tensors should be in range [0, 1]
-
-Observations:
-- When trajectory-length < 32 (often) we will always get a lot of zero-padded initialized history states as part of the repnet input
-    ---> Solution: set self.state_history_length to smaller number 
-
-"""
