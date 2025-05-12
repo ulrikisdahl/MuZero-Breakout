@@ -70,8 +70,6 @@ class RLSystem:
     def __init__(self, cfg: dict):
         #hyperparams
         self.num_episodes = cfg["num_episodes"]
-        self.num_steps = cfg["num_steps"] 
-        self.num_simulations = cfg["num_simulations"]
         self.minibatch_size = cfg["minibatch_size"]
         self.real_resolution = cfg["real_resolution"]
         self.latent_resolution = cfg["latent_resolution"]
@@ -79,9 +77,7 @@ class RLSystem:
         self.actions = cfg["actions"]
         self.n_actions = len(self.actions)
         self.K = cfg["num_unroll_steps"]
-        self.gamma = cfg["discount_factor"]
         self.iterations = cfg["num_iterations"]
-        self.epochs = cfg["epochs"]
         self.n_parallel = cfg["n_parallel"]
         self.temperature = 1.0
         self.max_steps_test = 200
@@ -91,8 +87,7 @@ class RLSystem:
         self.mu_zero = mu_zero_class(cfg["model"]) 
         self.mu_zero_target = mu_zero_class(cfg["model"]) #Target Network
         self.mu_zero_target.load_state_dict(self.mu_zero.state_dict())
-        # latent_mcts_class = get_class("src.parallel_mcts", cfg["search"]["mcts_name"])
-        latent_mcts_class = get_class("src.parallel_mcts_2", cfg["search"]["mcts_name"])
+        latent_mcts_class = get_class("src.mcts", cfg["search"]["mcts_name"])
         self.scalar_transforms = ScalarTransforms(cfg["model"])
         self.latent_mcts = latent_mcts_class(cfg, self.mu_zero_target, self.scalar_transforms) #NOTE: passing the networks like this is not good
         environment_class = get_class(cfg["environment"]["environment_path"], cfg["environment"]["environment_name"])
@@ -109,7 +104,6 @@ class RLSystem:
         self.training_iteration = 0
         self.training_step = 0
         self.num_batches = cfg["num_batches"]
-        # self.acting_steps = 0 
 
         #logging 
         self.logdir = "logs/train_data/"
@@ -125,15 +119,13 @@ class RLSystem:
         if self.load_weights:
             self._load_weights()
 
-        self.mcts_iter = 0
-        self.saved_weights = 0
 
     def train(self):
         """
         The training loop iteratively exchanges between acting stage and training stage
         """
         started_training = False
-        for iteration in range(self.init_iteration, 50000):
+        for iteration in range(self.init_iteration, self.iterations):
             if self.training_iteration > 10:
                 #start temperature decay
                 self.temperature *= 0.996
@@ -237,7 +229,6 @@ class RLSystem:
         
         rewards = self.replay_buffer.get_reward_sums()
         avg_reward = mean(rewards)
-        self.saved_weights += 1
         self.filewriter.add_scalar("Reward/avg", avg_reward, global_step=self.acting_step)
         self.acting_step += 1
 

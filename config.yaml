@@ -1,21 +1,18 @@
 parameters:
   num_iterations: 50000 #number of total runs
-  training_interval: 0 #not used
   num_episodes: 2 #16 #number of n_parallel*epiosode iterations (each creates n_parallel episodes) <--- N-Batches
-  num_steps: 0
   num_unroll_steps: 5  #K
-  num_simulations: 50 #21 #in MCTS
-  epochs: 4
+  num_simulations: 20 #50 #in MCTS
   d_max: 0 #max search depth
   actions: [0, 1, 2]
-  minibatch_size: 512 #depends on num_episodes
-  num_batches: 15
+  minibatch_size: 24 #512 
+  num_batches: 1 #15
   discount_factor: 0.985
   latent_resolution: [4, 5]
   real_resolution: [16, 20]
-  n_parallel: 24 #should be 32
+  n_parallel: 24 
 
-  
+  #replay buffer
   samples_before_train: 35000
   replay_buffer_max: 60000 
 
@@ -23,19 +20,19 @@ parameters:
   checkpoint_path: "weights/checkpt1.pth"
 
   search:
-    mcts_name: "MCTSSearchVec" #"MCTSSearch"
+    mcts_name: "MCTSSearchVec" 
     c1: 1.25
     c2: 19652.0   
     discount_factor: 0.985
 
   model:
-    learning_rate: 0.0002 # 0.001
+    learning_rate: 0.0002 
     agent_name: "MuZeroAgent"
-    num_supports: 11 #for support integers in [-300, 300] (paper page 14)
+    num_supports: 11 
     supports_min: -5
     supports_max: 5
     latent_channels: [128, 256] #number of channels we use in the latent space 
-    state_history_length: 32 #Should be at least 20 - this is the number of steps it takes to see a whole game from start to finish (requires padding history-len)
+    state_history_length: 32 #
     device: "cuda"
     latent_resolution: [4, 5] #Redundant
 
@@ -54,14 +51,12 @@ parameters:
       activation: "relu" #activation for conv block   
 
   environment:
-    # environment_name: "BreakoutEnvironment"
     environment_name: "BreakoutEnvironment"
-    # environment_path: "environment.breakout"
     environment_path: "environment.parallel_breakout"
     resolution: [16, 16] #[height, width]
     brick_rows: 5
     n_parallel: 24
-    paddle_hit_reward: 0.0 #1.0
+    paddle_hit_reward: 0.0 
     brick_hit_reward: 1.0 
-    game_lost_reward: -1.0 #0.0
+    game_lost_reward: -1.0 
     game_won_reward: 5.0

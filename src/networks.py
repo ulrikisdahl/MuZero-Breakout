@@ -49,7 +49,6 @@ class RepresentationNetwork(nn.Module):
                 in_channels=in_ch,
                 out_channels=latent_ch[0],
                 kernel_size=(3,3),
-                # stride=2, #NOTE: Only for ALE breakout environment
                 stride=1, 
                 padding=1
             )
@@ -62,12 +61,11 @@ class RepresentationNetwork(nn.Module):
                 )
             )
         
-        self.blocks.append( #TODO: add activations after convs (even though paper doesnt specify it)
+        self.blocks.append( 
             nn.Conv2d(
                 in_channels=latent_ch[0],
                 out_channels=latent_ch[1],
                 kernel_size=(3,3),
-                # stride=2, #NOTE: gym ALE environment
                 stride=1,
                 padding=1
             )
@@ -113,12 +111,12 @@ class DynamicsNetwork(nn.Module):
         super().__init__()
         self.num_res_blocks = cfg["dynamics_network"]["num_res_blocks"]
         activation = cfg["dynamics_network"]["activation"]
-        num_supports = cfg["num_supports"] #601 supports in range [-300, 300] 
+        num_supports = cfg["num_supports"] 
         num_actions = cfg["dynamics_network"]["num_actions"]
 
         self.conv_block = ConvBlock(
             activation=activation,
-            in_ch=in_ch + num_actions, # +num_actions for action encoding
+            in_ch=in_ch + num_actions,
             out_ch=in_ch,
             stride=1
         )
@@ -141,7 +139,7 @@ class DynamicsNetwork(nn.Module):
             ConvBlock(
                 activation=activation,
                 in_ch=in_ch,
-                out_ch=in_ch, #NOTE: should be 1 according to AlphaGo Appendix
+                out_ch=in_ch, 
                 stride=1,
                 kernel_size=1,
                 padding=0
@@ -268,7 +266,6 @@ class MuZeroAgent(nn.Module):
         self.pred_net.to(self.device)
 
         self.optimizer = torch.optim.Adam(self.parameters(), lr=cfg["learning_rate"], weight_decay=0.0001)
-        # self.scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lambda t: max(0.01 / 0.1, torch.exp(torch.tensor([-0.1 * t])).item())) #exponential decay
 
 
     def create_hidden_state_root(self, state: torch.tensor):
@@ -278,8 +275,6 @@ class MuZeroAgent(nn.Module):
         Args:
             state (bs, state_history_length * 3 + state_history_length, resolution[0], resolution[1])
         """
-        # state = self.resize_transform(state) #NOTE: These two first lines are only necessary for ALE breakout environment
-        # state = self._scale_state(state)
         hidden_state_0 = self.rep_net(state.to(self.device)) 
         hidden_state_0_scaled = self._scale_state(hidden_state_0)
         return hidden_state_0_scaled
@@ -354,47 +349,3 @@ class MuZeroAgent(nn.Module):
         self.dyn_net.train()
         self.pred_net.train()
 
-
-if __name__ == "__main__":
-    """
-    python3 -m src.networks
-    """
-    import yaml
-    import matplotlib.pyplot as plt
-    import numpy as np
-
-    with open("config.yaml", "r") as file:
-        config = yaml.safe_load(file)
-
-    muzero = MuZeroAgent(config["parameters"]["model"])
-
-    # hidden_state = torch.ones((32, 256, 4, 5)).to("cuda")
-    # policy_distribution, value = muzero.evaluate_state(hidden_state)
-    # print(f"Policy distribution: {policy_distribution.shape}, Value: {value.shape}")
-
-    normal_state = torch.ones(32, 128, 16, 20).to("cuda")
-    hidden_state = muzero.create_hidden_state_root(normal_state)
-    print(f"Hidden sate 0: {hidden_state.shape}")
-
-    plt.imshow(np.ones((3,3)))
-    plt.show()
-
-    # prev_hidden_state = hidden_state
-    # action = torch.ones((32, 1, 6, 6)) 
-    # next_hidden_state = muzero.hidden_state_transition(prev_hidden_state, action)
-    # print(f"Next hidden state: {next_hidden_state[0].shape}, Reward: {next_hidden_state[1].shape}")
-
-    # print()
-    # for param in muzero.parameters():
-    #     print(param.shape)
-
-    # print(f"N-params: {sum(1 for _ in muzero.parameters())}")
-    # print("done")
-    
-
-"""
-QUESTIONS
-
- - Supports are in range [-300, 300], but the invertible_transform(x) cant take in negative x values  --->  Forgot that formula uses torch.abs
-    - Also paper says that prediction network outputs with Tanh-range (this is mainly said in AlphaGo Zero though)?
-"""

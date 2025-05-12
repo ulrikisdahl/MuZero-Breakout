@@ -24,7 +24,7 @@ class MCTSSearchVec:
     def search(self, hidden_state: torch.tensor, action_mask: torch.tensor, training_iteration: int):
         """
         Performs a latent MCTS search and returns the visit count statistics from the root node
-        Parallel: Traverses each sample's MCTS tree sequentially each simulation-iteration, but builds up a "buffer"
+        Semi-Parallel: Traverses each sample's MCTS tree sequentially each simulation-iteration, but builds up a "buffer"
                   of expanded states in order to call the networks in parallel on GPU
 
         Args:

@@ -6,7 +6,7 @@
 - train_torch.py: The RL system responsible for running the environment and recording observations
 - src/mcts.py: Monte Carlo Tree Search algorithm for running search in the latent space
 - src/networks.py: MuZero agent, containing the Representation Network, Dynamics Network and the Prediction Network
-- environment/parallel_breakout: Vectorized cusom breakout implementation
+- environment/parallel_breakout: Vectorized custom breakout implementation
 
 
 ### Deviations from MuZero paper
