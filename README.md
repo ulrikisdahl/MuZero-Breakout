@@ -1,6 +1,6 @@
 ### How to run
 ```python3 train_torch.py``` 
-- For tensorboard visualization: ```tensorboard --samples_per_plugin images=300 --logdir=logs/train_data```
+- For tensorboard visualization: ```tensorboard --samples_per_plugin images=300 --logdir=logs/...```
 
 ### Repository structure
 - train_torch.py: The RL system responsible for running the environment and recording observations
