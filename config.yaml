@@ -1,12 +1,11 @@
 parameters:
   num_iterations: 50000 #number of total runs
-  num_episodes: 2 #16 #number of n_parallel*epiosode iterations (each creates n_parallel episodes) <--- N-Batches
+  num_episodes: 2 #number of episode-batches we generate per acting stage
   num_unroll_steps: 5  #K
-  num_simulations: 20 #50 #in MCTS
-  d_max: 0 #max search depth
+  num_simulations: 50 #in MCTS
   actions: [0, 1, 2]
-  minibatch_size: 24 #512 
-  num_batches: 1 #15
+  minibatch_size: 512 
+  num_batches: 15
   discount_factor: 0.985
   latent_resolution: [4, 5]
   real_resolution: [16, 20]
