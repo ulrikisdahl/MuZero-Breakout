@@ -8,6 +8,8 @@
 - src/networks.py: MuZero agent, containing the Representation Network, Dynamics Network and the Prediction Network
 - environment/parallel_breakout: Vectorized custom breakout implementation
 
+<img src="static/gitDiagram.jpeg" width="550" height="220" alt="Repo diagram from gitdiagram.com"/>
+
 
 ### Deviations from MuZero paper
 - Removed action mask from the root node of the MCTS search, since this had a tendancy to create a slight bias in the action distribution of the search.
